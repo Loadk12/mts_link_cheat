@@ -80,7 +80,7 @@ def _tg(cfg):
 
 
 async def _send(cfg, text: str):
-    token, chat = _tg(cfg)
+    token, chat, *_ = _tg(cfg)
     if not token or not chat:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
