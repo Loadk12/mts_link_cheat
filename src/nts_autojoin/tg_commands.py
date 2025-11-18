@@ -210,18 +210,32 @@ async def run_bot(
         allowed_ids = []
 
     offset = _read_offset()
-    if offset == 0:
-        # праймим offset, чтобы не отработали старые команды
-        try:
-            url = f"https://api.telegram.org/bot{token}/getUpdates"
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, params={"timeout": 0, "offset": -1}, timeout=10) as r:
-                    data = await r.json()
-            last = max([x["update_id"] for x in data.get("result", [])], default=None)
-            offset = (last + 1) if last is not None else 0
-        except Exception:
-            offset = 0
-        _write_offset(offset)
+
+    # праймим offset, чтобы не отработали старые команды,
+    # и сбрасываем его, если сохранённое значение убежало слишком далеко.
+    try:
+        url = f"https://api.telegram.org/bot{token}/getUpdates"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params={"timeout": 0, "offset": -1}, timeout=10) as r:
+                data = await r.json()
+        last = max([x["update_id"] for x in data.get("result", [])], default=None)
+    except Exception:
+        last = None
+
+    if last is not None:
+        max_valid_offset = last + 1
+        if offset == 0:
+            offset = max_valid_offset
+        elif offset > max_valid_offset:
+            logger.warning(
+                "TG offset %s >> last %s; сбрасываем на %s",
+                offset,
+                last,
+                max_valid_offset,
+            )
+            offset = max_valid_offset
+
+    _write_offset(offset)
 
     async def _cmd_links() -> str:
         c = _load_cfg()
