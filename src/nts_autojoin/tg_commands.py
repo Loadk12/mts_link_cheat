@@ -69,8 +69,14 @@ def _load_cfg() -> dict:
 
 
 def _tg(cfg):
+    """Возвращает настройки Telegram: токен, чат и список разрешённых ID."""
+
     n = cfg.get("notify") or {}
-    return n.get("telegram_bot_token"), n.get("telegram_chat_id")
+    return (
+        n.get("telegram_bot_token"),
+        n.get("telegram_chat_id"),
+        n.get("allowed_user_ids") or [],
+    )
 
 
 async def _send(cfg, text: str):
