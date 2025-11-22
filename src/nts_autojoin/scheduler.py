@@ -10,7 +10,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from .browser import create_browser
-from .join_flow import perform_join
+from .join_flow import perform_join, ensure_media_disabled
 from .healthcheck import page_is_healthy
 from .live import set_page, clear_page
 from .notifier import notify, send_photo
@@ -122,6 +122,10 @@ async def run_meeting(
         await page.goto(url, wait_until="domcontentloaded")
         if join_cfg:
             await perform_join(page, join_cfg)
+        try:
+            await ensure_media_disabled(page)
+        except Exception as e:
+            logger.warning(f"[{name}] не удалось гарантировать выключение медиа: {e}")
 
         deadline = _now(tzname) + timedelta(minutes=duration_min)
         consecutive_failures = 0
