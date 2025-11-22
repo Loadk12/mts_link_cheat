@@ -12,8 +12,9 @@ from datetime import datetime, timedelta
 from .notifier import notify, send_document, send_photo
 from .healthcheck import page_is_healthy
 from .live import get_any_page
-
-OFFSET_FILE = Path("logs/tg_offset.state")
+from .settings import load_config
+BASE_DIR = Path(__file__).resolve().parents[2]
+OFFSET_FILE = BASE_DIR / "logs" / "tg_offset.state"
 STALE_SEC = 300  # игнор опасных команд старше 5 минут
 
 
@@ -72,8 +73,9 @@ def _next_occurrence(cron_expr: str, tzinfo):
 
 
 def _load_cfg() -> dict:
-    with open("config/schedule.yaml", "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    # Используем общий загрузчик, чтобы путь работал и из под nssm/systemd,
+    # где рабочая директория может отличаться от корня репозитория.
+    return load_config()
 
 
 def _tg(cfg):
