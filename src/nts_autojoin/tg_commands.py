@@ -89,8 +89,9 @@ def _tg(cfg):
     )
 
 
-async def _send(cfg, text: str):
-    token, chat, *_ = _tg(cfg)
+async def _send(cfg, text: str, chat_id: Optional[int] = None):
+    token, default_chat, *_ = _tg(cfg)
+    chat = chat_id or default_chat
     if not token or not chat:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -293,17 +294,23 @@ async def run_bot(
         if allowed_ids and chat_id not in allowed_ids:
             return
 
+        async def send_reply(message: str):
+            await _send(cfg, message, chat_id)
+
+        async def send_photo_reply(path: str, caption: str = ""):
+            await send_photo(cfg, path, caption=caption, chat_id=chat_id)
+
         now_epoch = int(datetime.utcnow().timestamp())
         is_stale = (now_epoch - int(ts)) > STALE_SEC
         parts = text.strip().split(maxsplit=2)
         cmd = parts[0].lower()
 
         if cmd in ("/help", "/start"):
-            await _send(cfg, HELP)
+            await send_reply(HELP)
             return
 
         if cmd == "/status":
-            await _send(cfg, _today_summary(_load_cfg()))
+            await send_reply(_today_summary(_load_cfg()))
             return
 
         if cmd == "/health":
@@ -311,46 +318,46 @@ async def run_bot(
             try:
                 page = get_any_page()
                 if not page:
-                    await _send(cfg, "Нет активных вкладок.")
+                    await send_reply("Нет активных вкладок.")
                     return
                 ok = await page_is_healthy(page, cfg.get("healthcheck", {}) or {})
-                await _send(cfg, f"Текущий статус: {'OK' if ok else 'FAIL'}")
+                await send_reply(f"Текущий статус: {'OK' if ok else 'FAIL'}")
             except Exception as e:
-                await _send(cfg, f"Не удалось проверить здоровье: {e}")
+                await send_reply(f"Не удалось проверить здоровье: {e}")
             return
 
         if cmd == "/links":
-            await _send(cfg, await _cmd_links())
+            await send_reply(await _cmd_links())
             return
 
         if cmd == "/pull":
             if is_stale:
-                await _send(cfg, "⏭️ Игнорирую старую команду /pull.")
+                await send_reply("⏭️ Игнорирую старую команду /pull.")
                 return
             msg = await dmami_pull_cb()
-            await _send(cfg, msg)
+            await send_reply(msg)
             return
 
         if cmd == "/reload":
             if is_stale:
-                await _send(cfg, "⏭️ Игнорирую старую команду /reload.")
+                await send_reply("⏭️ Игнорирую старую команду /reload.")
                 return
             await reload_cb()
-            await _send(cfg, "♻️ Конфиг перечитан и перепланирован.")
+            await send_reply("♻️ Конфиг перечитан и перепланирован.")
             return
 
         if cmd == "/disconnect":
             if is_stale:
-                await _send(cfg, "⏭️ Игнорирую старую команду /disconnect.")
+                await send_reply("⏭️ Игнорирую старую команду /disconnect.")
                 return
             msg = await disconnect_cb()
-            await _send(cfg, msg)
+            await send_reply(msg)
             return
 
         if cmd == "/shot":
             path = await screenshot_cb()
             if path:
-                await send_photo(cfg, path, caption="📷 Текущая вкладка (Playwright)")
+                await send_photo_reply(path, caption="📷 Текущая вкладка (Playwright)")
                 return
             # fallback — десктоп
             try:
@@ -362,14 +369,14 @@ async def run_bot(
                 out = f"logs/deskshot_{tsname}.png"
                 with mss() as sct:
                     sct.shot(output=out)
-                await send_photo(cfg, out, caption="🖥️ Скрин рабочего стола (fallback)")
+                await send_photo_reply(out, caption="🖥️ Скрин рабочего стола (fallback)")
             except Exception as e:
-                await _send(cfg, f"📷 Не смог снять десктоп: {e}")
+                await send_reply(f"📷 Не смог снять десктоп: {e}")
             return
 
         if cmd == "/connect":
             if is_stale:
-                await _send(cfg, "⏭️ Игнорирую старую команду /connect.")
+                await send_reply("⏭️ Игнорирую старую команду /connect.")
                 return
 
             m_full = CONNECT_FULL.match(text)
@@ -387,7 +394,7 @@ async def run_bot(
                 )
                 dur_min = int(dur) if dur else 90
                 msg = await connect_cb(url, hh, mm, dur_min)
-                await _send(cfg, msg)
+                await send_reply(msg)
                 return
 
             if m_url:
@@ -395,7 +402,7 @@ async def run_bot(
                 url = m_url.group(1)
                 now = datetime.now(tzinfo)
                 msg = await connect_cb(url, now.hour, now.minute, 90)
-                await _send(cfg, msg)
+                await send_reply(msg)
                 return
 
             if m_time:
@@ -404,18 +411,17 @@ async def run_bot(
                 dur = int(m_time.group(3) or 90)
                 pick = _pick_current_meeting(_load_cfg())
                 if not pick:
-                    await _send(cfg, "Не нашёл подходящую встречу в расписании.")
+                    await send_reply("Не нашёл подходящую встречу в расписании.")
                     return
                 m, start, end = pick
                 msg = await connect_cb(m["url"], hh, mm, dur)
-                await _send(cfg, msg)
+                await send_reply(msg)
                 return
 
             # ничего не подошло → берём текущую/ближайшую встречу и стартуем сейчас
             pick = _pick_current_meeting(_load_cfg())
             if not pick:
-                await _send(
-                    cfg,
+                await send_reply(
                     "Не понял параметры. Использование: /connect <url?> <HH:MM?> [длит_мин]",
                 )
                 return
@@ -424,13 +430,13 @@ async def run_bot(
             msg = await connect_cb(
                 m["url"], now.hour, now.minute, int(m.get("duration_minutes", 90))
             )
-            await _send(cfg, msg)
+            await send_reply(msg)
             return
 
         if cmd == "/restart":
             # эту команду ты можешь повесить на systemd-юнит через shell-скрипт,
             # здесь можно просто залогировать/проигнорировать
-            await _send(cfg, "Команда /restart пока не реализована.")
+            await send_reply("Команда /restart пока не реализована.")
             return
 
     while True:

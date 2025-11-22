@@ -31,8 +31,9 @@ async def send_document(cfg, file_path: str, caption: str = ""):
         async with s.post(url, data=form, timeout=120) as r:
             await r.text()
 
-async def send_photo(cfg, file_path: str, caption: str = ""):
-    token, chat = _tg(cfg)
+async def send_photo(cfg, file_path: str, caption: str = "", chat_id: int | None = None):
+    token, default_chat = _tg(cfg)
+    chat = chat_id or default_chat
     if not token or not chat:
         return
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
