@@ -3,7 +3,7 @@ import asyncio
 import re
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict
+from typing import Dict, List, Tuple
 
 from dateutil import tz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -30,6 +30,25 @@ def _now(tzname: str) -> datetime:
 
 def _ensure_logs_dir():
     Path("logs").mkdir(parents=True, exist_ok=True)
+
+
+# Активные встречи: name -> (stop_event, started_at)
+_active_runs: dict[str, Tuple[asyncio.Event, datetime]] = {}
+
+
+def active_meetings() -> List[str]:
+    return list(_active_runs.keys())
+
+
+def request_stop_active() -> List[str]:
+    """Запросить остановку всех текущих встреч. Возвращает их имена."""
+
+    names = []
+    for name, (ev, _started) in list(_active_runs.items()):
+        if not ev.is_set():
+            ev.set()
+            names.append(name)
+    return names
 
 
 async def _save_artifacts(page, prefix: str, tzname: str, logger) -> str:
@@ -111,6 +130,9 @@ async def run_meeting(
 
     await notify(global_cfg, f"▶️ [{name}] старт.")
 
+    stop_event = asyncio.Event()
+    _active_runs[name] = (stop_event, _now(tzname))
+
     try:
         # Старт браузера
         pw, browser = await create_browser(chromium_cfg)
@@ -130,7 +152,15 @@ async def run_meeting(
         deadline = _now(tzname) + timedelta(minutes=duration_min)
         consecutive_failures = 0
 
-        while _now(tzname) < deadline:
+        while True:
+            if stop_event.is_set():
+                await notify(global_cfg, f"⏹️ [{name}] остановлен вручную.")
+                break
+
+            if _now(tzname) >= deadline:
+                await notify(global_cfg, f"⏹️ [{name}] время вышло, выхожу.")
+                break
+
             try:
                 ok = await page_is_healthy(page, hc_cfg)
             except Exception as e:
@@ -161,10 +191,11 @@ async def run_meeting(
                     )
                     break
 
-            await asyncio.sleep(max(30, every_minutes * 60))
-
-        if _now(tzname) >= deadline:
-            await notify(global_cfg, f"⏹️ [{name}] время вышло, выхожу.")
+            sleep_for = max(30, every_minutes * 60)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+            except asyncio.TimeoutError:
+                pass
     except Exception as e:
         logger.error(f"[{name}] meeting error: {e}")
         if page is not None:
@@ -182,6 +213,10 @@ async def run_meeting(
         except Exception:
             pass
     finally:
+        try:
+            _active_runs.pop(name, None)
+        except Exception:
+            pass
         try:
             clear_page(name)
         except Exception:

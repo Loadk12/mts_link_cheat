@@ -214,6 +214,7 @@ HELP = (
     "/reload — перечитать config/schedule.yaml\n"
     "/restart — перезапустить сервис (через systemd, если настроено)\n"
     "/connect — подключиться к текущей/заданной лекции\n\n"
+    "/disconnect — выйти из активной конференции\n\n"
     "Синтаксис /connect:\n"
     "• /connect — взять текущую/ближайшую встречу и войти сейчас\n"
     "• /connect HH:MM — взять текущую/ближайшую, посидеть до HH:MM\n"
@@ -238,6 +239,7 @@ async def run_bot(
     screenshot_cb: Callable[[], Awaitable[str | None]],
     dmami_pull_cb: Callable[[], Awaitable[str]],
     connect_cb: Callable[[str, int, int, int], Awaitable[str]],  # url, hh, mm, dur_min
+    disconnect_cb: Callable[[], Awaitable[str]],
     logger,
 ):
     token, default_chat, allowed = _tg(cfg)
@@ -335,6 +337,14 @@ async def run_bot(
                 return
             await reload_cb()
             await _send(cfg, "♻️ Конфиг перечитан и перепланирован.")
+            return
+
+        if cmd == "/disconnect":
+            if is_stale:
+                await _send(cfg, "⏭️ Игнорирую старую команду /disconnect.")
+                return
+            msg = await disconnect_cb()
+            await _send(cfg, msg)
             return
 
         if cmd == "/shot":
