@@ -291,22 +291,28 @@ async def run_bot(
     async def handle(chat_id: int, text: str, ts: int, upd_id: int):
         nonlocal cfg
 
-        if allowed_ids and chat_id not in allowed_ids:
-            return
-
         async def send_reply(message: str):
             await _send(cfg, message, chat_id)
 
         async def send_photo_reply(path: str, caption: str = ""):
             await send_photo(cfg, path, caption=caption, chat_id=chat_id)
 
+        async def send_help():
+            await send_reply(HELP)
+
         now_epoch = int(datetime.utcnow().timestamp())
         is_stale = (now_epoch - int(ts)) > STALE_SEC
         parts = text.strip().split(maxsplit=2)
         cmd = parts[0].lower()
 
+        is_allowed = not allowed_ids or chat_id in allowed_ids
+
         if cmd in ("/help", "/start"):
-            await send_reply(HELP)
+            await send_help()
+            return
+
+        if not is_allowed:
+            await send_help()
             return
 
         if cmd == "/status":
@@ -438,6 +444,8 @@ async def run_bot(
             # здесь можно просто залогировать/проигнорировать
             await send_reply("Команда /restart пока не реализована.")
             return
+
+        await send_help()
 
     while True:
         try:
