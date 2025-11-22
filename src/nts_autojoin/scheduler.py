@@ -70,6 +70,160 @@ async def _save_artifacts(page, prefix: str, tzname: str, logger) -> str:
     return base
 
 
+async def _send_success_screenshot(page, prefix: str, tzname: str, cfg: dict, name: str, logger):
+    """Отправить скриншот спустя 10 секунд после успешного входа."""
+
+    try:
+        await page.wait_for_timeout(10_000)
+        base = await _save_artifacts(page, f"{prefix}_joined", tzname, logger)
+        try:
+            await send_photo(
+                cfg,
+                f"{base}.png",
+                caption=f"✅ [{name}] скрин после входа",
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f"[{name}] не удалось отправить скриншот после входа: {e}")
+
+
+async def _run_meeting_attempt(
+    name: str,
+    url: str,
+    join_cfg: Dict,
+    chromium_cfg: dict,
+    hc_cfg: dict,
+    global_cfg: dict,
+    logger,
+    stop_event: asyncio.Event,
+    deadline: datetime,
+    fail_threshold: int,
+    every_minutes: int,
+    prefix: str,
+    attempt: int,
+    total_attempts: int,
+    tzname: str,
+):
+    pw = browser = context = page = None
+    success_shot_task = None
+
+    try:
+        pw, browser = await create_browser(chromium_cfg)
+        context = await browser.new_context()
+        page = await context.new_page()
+        set_page(name, page)
+
+        await page.goto(url, wait_until="domcontentloaded")
+        if join_cfg:
+            await perform_join(page, join_cfg)
+        try:
+            await ensure_media_disabled(page)
+        except Exception as e:
+            logger.warning(f"[{name}] не удалось гарантировать выключение медиа: {e}")
+
+        success_shot_task = asyncio.create_task(
+            _send_success_screenshot(page, prefix, tzname, global_cfg, name, logger)
+        )
+
+        consecutive_failures = 0
+        ever_healthy = False
+
+        while True:
+            if stop_event.is_set():
+                await notify(global_cfg, f"⏹️ [{name}] остановлен вручную.")
+                return True
+
+            now = _now(tzname)
+            if now >= deadline:
+                await notify(global_cfg, f"⏹️ [{name}] время вышло, выхожу.")
+                return True
+
+            try:
+                ok = await page_is_healthy(page, hc_cfg)
+            except Exception as e:
+                logger.warning(f"[{name}] healthcheck error: {e}")
+                ok = False
+
+            if ok:
+                ever_healthy = True
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                logger.warning(
+                    f"[{name}] healthcheck FAIL "
+                    f"({consecutive_failures}/{fail_threshold})"
+                )
+                base = await _save_artifacts(page, prefix, tzname, logger)
+                try:
+                    await send_photo(
+                        global_cfg,
+                        f"{base}.png",
+                        caption=f"⛔ [{name}] healthcheck fail (попытка {attempt}/{total_attempts})",
+                    )
+                except Exception:
+                    pass
+                if consecutive_failures >= fail_threshold:
+                    await notify(
+                        global_cfg,
+                        f"⛔ [{name}] здоровье страницы упало, перезапускаю попытку.",
+                    )
+                    return False
+
+            sleep_for = max(30, every_minutes * 60)
+            remaining = max(0, (deadline - _now(tzname)).total_seconds())
+            timeout = min(sleep_for, remaining) if remaining else sleep_for
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+
+    except Exception as e:
+        logger.error(f"[{name}] meeting error: {e}")
+        if page is not None:
+            base = await _save_artifacts(page, prefix, tzname, logger)
+            try:
+                await send_photo(
+                    global_cfg,
+                    f"{base}.png",
+                    caption=f"⛔ [{name}] ошибка встречи (попытка {attempt}/{total_attempts})",
+                )
+            except Exception:
+                pass
+        try:
+            await notify(global_cfg, f"⛔ [{name}] ошибка: {e}")
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            if success_shot_task and not success_shot_task.done():
+                success_shot_task.cancel()
+        except Exception:
+            pass
+        try:
+            clear_page(name)
+        except Exception:
+            pass
+        try:
+            if context is not None:
+                await context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                await browser.close()
+        except Exception:
+            pass
+        try:
+            if pw is not None:
+                await pw.stop()
+        except Exception:
+            pass
+
+    return True if ever_healthy else False
+
+
 def _parse_cfg_date(value):
     if not value:
         return None
@@ -92,7 +246,8 @@ async def run_meeting(
 ):
     """
     Одна встреча: открываем Chrome, проходим join, проверяем здоровье страницы,
-    при сбоях сохраняем скрины/HTML и шлём алерты.
+    при сбоях сохраняем скрины/HTML и шлём алерты. Добавлены автоскрины после
+    входа и повторные попытки при неудаче.
     """
     name = meeting.get("name", "Безымянка")
     url = meeting["url"]
@@ -125,93 +280,66 @@ async def run_meeting(
     fail_threshold = int(hc_cfg.get("fail_threshold", 2))
     every_minutes = int(hc_cfg.get("every_minutes", 5))
 
-    pw = browser = context = page = None
     prefix = _sanitize(name)
+    deadline = _now(tzname) + timedelta(minutes=duration_min)
 
     await notify(global_cfg, f"▶️ [{name}] старт.")
 
     stop_event = asyncio.Event()
     _active_runs[name] = (stop_event, _now(tzname))
 
+    retry_delays = [0, 60, 120, 300]
+    total_attempts = len(retry_delays)
+    success = False
+
     try:
-        # Старт браузера
-        pw, browser = await create_browser(chromium_cfg)
-        context = await browser.new_context()
-        page = await context.new_page()
-        set_page(name, page)
-
-        # Переходим на ссылку и выполняем join-скрипт
-        await page.goto(url, wait_until="domcontentloaded")
-        if join_cfg:
-            await perform_join(page, join_cfg)
-        try:
-            await ensure_media_disabled(page)
-        except Exception as e:
-            logger.warning(f"[{name}] не удалось гарантировать выключение медиа: {e}")
-
-        deadline = _now(tzname) + timedelta(minutes=duration_min)
-        consecutive_failures = 0
-
-        while True:
+        for attempt, delay in enumerate(retry_delays, start=1):
             if stop_event.is_set():
-                await notify(global_cfg, f"⏹️ [{name}] остановлен вручную.")
                 break
 
-            if _now(tzname) >= deadline:
-                await notify(global_cfg, f"⏹️ [{name}] время вышло, выхожу.")
-                break
-
-            try:
-                ok = await page_is_healthy(page, hc_cfg)
-            except Exception as e:
-                logger.warning(f"[{name}] healthcheck error: {e}")
-                ok = False
-
-            if ok:
-                consecutive_failures = 0
-            else:
-                consecutive_failures += 1
-                logger.warning(
-                    f"[{name}] healthcheck FAIL "
-                    f"({consecutive_failures}/{fail_threshold})"
-                )
-                base = await _save_artifacts(page, prefix, tzname, logger)
+            if delay:
                 try:
-                    await send_photo(
+                    await notify(
                         global_cfg,
-                        f"{base}.png",
-                        caption=f"⛔ [{name}] healthcheck fail",
+                        f"🔁 [{name}] повторная попытка через {int(delay/60)} мин "
+                        f"({attempt}/{total_attempts}).",
                     )
                 except Exception:
                     pass
-                if consecutive_failures >= fail_threshold:
-                    await notify(
-                        global_cfg,
-                        f"⛔ [{name}] здоровье страницы упало, выхожу раньше срока.",
-                    )
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                if stop_event.is_set():
                     break
 
-            sleep_for = max(30, every_minutes * 60)
+            attempt_prefix = f"{prefix}_try{attempt}"
+            attempt_success = await _run_meeting_attempt(
+                name,
+                url,
+                join_cfg,
+                chromium_cfg,
+                hc_cfg,
+                global_cfg,
+                logger,
+                stop_event,
+                deadline,
+                fail_threshold,
+                every_minutes,
+                attempt_prefix,
+                attempt,
+                total_attempts,
+                tzname,
+            )
+            if attempt_success:
+                success = True
+                break
+
+        if not success and not stop_event.is_set():
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
-            except asyncio.TimeoutError:
-                pass
-    except Exception as e:
-        logger.error(f"[{name}] meeting error: {e}")
-        if page is not None:
-            base = await _save_artifacts(page, prefix, tzname, logger)
-            try:
-                await send_photo(
-                    global_cfg,
-                    f"{base}.png",
-                    caption=f"⛔ [{name}] ошибка встречи",
-                )
+                await notify(global_cfg, f"⛔ [{name}] все попытки подключения исчерпаны.")
             except Exception:
                 pass
-        try:
-            await notify(global_cfg, f"⛔ [{name}] ошибка: {e}")
-        except Exception:
-            pass
     finally:
         try:
             _active_runs.pop(name, None)
@@ -219,21 +347,6 @@ async def run_meeting(
             pass
         try:
             clear_page(name)
-        except Exception:
-            pass
-        try:
-            if context is not None:
-                await context.close()
-        except Exception:
-            pass
-        try:
-            if browser is not None:
-                await browser.close()
-        except Exception:
-            pass
-        try:
-            if pw is not None:
-                await pw.stop()
         except Exception:
             pass
 
