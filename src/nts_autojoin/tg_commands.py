@@ -12,8 +12,9 @@ from datetime import datetime, timedelta
 from .notifier import notify, send_document, send_photo
 from .healthcheck import page_is_healthy
 from .live import get_any_page
-
-OFFSET_FILE = Path("logs/tg_offset.state")
+from .settings import load_config
+BASE_DIR = Path(__file__).resolve().parents[2]
+OFFSET_FILE = BASE_DIR / "logs" / "tg_offset.state"
 STALE_SEC = 300  # игнор опасных команд старше 5 минут
 
 
@@ -63,18 +64,33 @@ def _occurrences_today(cron_expr: str, tzinfo) -> List[datetime]:
     return occ
 
 
+def _next_occurrence(cron_expr: str, tzinfo):
+    """Вернуть ближайшее срабатывание cron после текущего момента."""
+
+    trig = CronTrigger.from_crontab(cron_expr, timezone=tzinfo)
+    now = datetime.now(tzinfo)
+    return trig.get_next_fire_time(None, now)
+
+
 def _load_cfg() -> dict:
-    with open("config/schedule.yaml", "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    # Используем общий загрузчик, чтобы путь работал и из под nssm/systemd,
+    # где рабочая директория может отличаться от корня репозитория.
+    return load_config()
 
 
 def _tg(cfg):
+    """Возвращает настройки Telegram: токен, чат и список разрешённых ID."""
+
     n = cfg.get("notify") or {}
-    return n.get("telegram_bot_token"), n.get("telegram_chat_id")
+    return (
+        n.get("telegram_bot_token"),
+        n.get("telegram_chat_id"),
+        n.get("allowed_user_ids") or [],
+    )
 
 
 async def _send(cfg, text: str):
-    token, chat = _tg(cfg)
+    token, chat, *_ = _tg(cfg)
     if not token or not chat:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -115,11 +131,42 @@ def _today_summary(cfg: dict) -> str:
         for dt in _occurrences_today(cron, tzinfo):
             items.append((dt, m))
     if not items:
-        return f"🗓️ Сегодня ({now.strftime('%d.%m.%Y')}, {cfg.get('timezone','Europe/Moscow')}) встреч нет."
+        # подскажем, когда стартует ближайшая встреча из расписания —
+        # это поможет заметить ошибочные даты (например, 2025 вместо 2024).
+        closest = []
+        for m in cfg.get("meetings", []) or []:
+            cron = m.get("cron")
+            if not cron:
+                continue
+            nxt = _next_occurrence(cron, tzinfo)
+            if not nxt:
+                continue
+            # фильтруем по старт/конечным датам
+            if not _meeting_active_on(m, nxt.date()):
+                continue
+            closest.append((nxt, m))
+
+        if not closest:
+            return (
+                f"🗓️ Сегодня ({now.strftime('%d.%m.%Y')}, {cfg.get('timezone','Europe/Moscow')}) встреч нет. "
+                "Ближайшие пары в расписании не найдены."
+            )
+
+        closest.sort(key=lambda x: x[0])
+        lines = [
+            f"🗓️ Сегодня ({now.strftime('%d.%m.%Y')}, {cfg.get('timezone','Europe/Moscow')}) встреч нет. "
+            "Ближайшие в расписании:",
+        ]
+        for dt, m in closest[:3]:
+            lines.append(
+                f"• {dt.strftime('%d.%m.%Y %H:%M')} — {m.get('name','Без названия')}"
+                f" ({int(m.get('duration_minutes', 45))} мин)"
+            )
+        return "\n".join(lines)
 
     items.sort(key=lambda x: x[0])
     lines = [
-        f"🗓️ План на сегодня — {now.strftime('%d.%m.%Y')} ({cfg.get('timezone','Europe/Moscow')}):"
+        f"🗓️ План на сегодня — {now.strftime('%d.%m.%Y')} ({cfg.get('timezone','Europe/Moscow')}):",
     ]
     for dt, m in items:
         name = m.get("name", "Без названия")
@@ -167,6 +214,7 @@ HELP = (
     "/reload — перечитать config/schedule.yaml\n"
     "/restart — перезапустить сервис (через systemd, если настроено)\n"
     "/connect — подключиться к текущей/заданной лекции\n\n"
+    "/disconnect — выйти из активной конференции\n\n"
     "Синтаксис /connect:\n"
     "• /connect — взять текущую/ближайшую встречу и войти сейчас\n"
     "• /connect HH:MM — взять текущую/ближайшую, посидеть до HH:MM\n"
@@ -191,6 +239,7 @@ async def run_bot(
     screenshot_cb: Callable[[], Awaitable[str | None]],
     dmami_pull_cb: Callable[[], Awaitable[str]],
     connect_cb: Callable[[str, int, int, int], Awaitable[str]],  # url, hh, mm, dur_min
+    disconnect_cb: Callable[[], Awaitable[str]],
     logger,
 ):
     token, default_chat, allowed = _tg(cfg)
@@ -204,18 +253,32 @@ async def run_bot(
         allowed_ids = []
 
     offset = _read_offset()
-    if offset == 0:
-        # праймим offset, чтобы не отработали старые команды
-        try:
-            url = f"https://api.telegram.org/bot{token}/getUpdates"
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, params={"timeout": 0, "offset": -1}, timeout=10) as r:
-                    data = await r.json()
-            last = max([x["update_id"] for x in data.get("result", [])], default=None)
-            offset = (last + 1) if last is not None else 0
-        except Exception:
-            offset = 0
-        _write_offset(offset)
+
+    # праймим offset, чтобы не отработали старые команды,
+    # и сбрасываем его, если сохранённое значение убежало слишком далеко.
+    try:
+        url = f"https://api.telegram.org/bot{token}/getUpdates"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params={"timeout": 0, "offset": -1}, timeout=10) as r:
+                data = await r.json()
+        last = max([x["update_id"] for x in data.get("result", [])], default=None)
+    except Exception:
+        last = None
+
+    if last is not None:
+        max_valid_offset = last + 1
+        if offset == 0:
+            offset = max_valid_offset
+        elif offset > max_valid_offset:
+            logger.warning(
+                "TG offset %s >> last %s; сбрасываем на %s",
+                offset,
+                last,
+                max_valid_offset,
+            )
+            offset = max_valid_offset
+
+    _write_offset(offset)
 
     async def _cmd_links() -> str:
         c = _load_cfg()
@@ -274,6 +337,14 @@ async def run_bot(
                 return
             await reload_cb()
             await _send(cfg, "♻️ Конфиг перечитан и перепланирован.")
+            return
+
+        if cmd == "/disconnect":
+            if is_stale:
+                await _send(cfg, "⏭️ Игнорирую старую команду /disconnect.")
+                return
+            msg = await disconnect_cb()
+            await _send(cfg, msg)
             return
 
         if cmd == "/shot":

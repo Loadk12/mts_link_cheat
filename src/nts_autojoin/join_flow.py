@@ -1,5 +1,52 @@
 from typing import Dict, Any, List
 
+
+MIC_SELECTORS = [
+    "button[data-testid*=\"Microphone\" i]",
+    "button[aria-label*=\"микроф\" i]",
+    "button[label*=\"микроф\" i]",
+    "[aria-label*=\"microphone\" i]",
+]
+
+CAMERA_SELECTORS = [
+    "button[data-testid*=\"Camera\" i]",
+    "button[data-testid*=\"Video\" i]",
+    "button[aria-label*=\"камер\" i]",
+    "button[label*=\"камера\" i]",
+    "[aria-label*=\"camera\" i]",
+    "[aria-label*=\"video\" i]",
+]
+
+MIC_ON_HINTS = [
+    "выключить микрофон",
+    "mute",
+    "turn off micro",
+    "turn off mic",
+]
+
+MIC_OFF_HINTS = [
+    "включить микрофон",
+    "unmute",
+    "turn on micro",
+    "turn on mic",
+]
+
+CAMERA_ON_HINTS = [
+    "выключить камеру",
+    "выключить видео",
+    "turn off camera",
+    "turn video off",
+    "stop video",
+]
+
+CAMERA_OFF_HINTS = [
+    "включить камеру",
+    "включить видео",
+    "turn on camera",
+    "turn video on",
+    "start video",
+]
+
 async def _exists(page, selector: str) -> bool:
     try:
         loc = page.locator(selector)
@@ -107,3 +154,52 @@ async def perform_join(page, join_cfg: Dict[str, Any]):
 
         else:
             raise ValueError(f"Unknown action: {action}")
+
+
+def _is_on(label: str, on_hints: List[str], off_hints: List[str]) -> bool:
+    lower = label.lower()
+    if any(h in lower for h in on_hints):
+        return True
+    if any(h in lower for h in off_hints):
+        return False
+    return True  # неизвестно — считаем, что нужно выключить на всякий случай
+
+
+async def _ensure_control_off(page, selectors: List[str], on_hints: List[str], off_hints: List[str]):
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if await loc.count() == 0:
+                continue
+
+            label = (
+                (await loc.get_attribute("aria-label"))
+                or (await loc.get_attribute("label"))
+                or ""
+            )
+
+            if _is_on(label, on_hints, off_hints):
+                await loc.click()
+                await page.wait_for_timeout(400)
+
+            # Вторичная проверка — если после клика состояние не сменилось по подсказке, попробуем ещё раз.
+            label_after = (
+                (await loc.get_attribute("aria-label"))
+                or (await loc.get_attribute("label"))
+                or ""
+            )
+            if _is_on(label_after, on_hints, off_hints):
+                await loc.click()
+                await page.wait_for_timeout(300)
+
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def ensure_media_disabled(page):
+    """Пытаемся гарантировать, что микрофон и камера выключены после входа."""
+
+    await _ensure_control_off(page, MIC_SELECTORS, MIC_ON_HINTS, MIC_OFF_HINTS)
+    await _ensure_control_off(page, CAMERA_SELECTORS, CAMERA_ON_HINTS, CAMERA_OFF_HINTS)

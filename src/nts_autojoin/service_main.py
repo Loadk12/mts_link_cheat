@@ -15,7 +15,7 @@ from .settings import load_config
 from .logging_setup import setup_logger
 from .power import keep_awake, on_ac_power
 from .notifier import notify
-from .scheduler import schedule_jobs, run_meeting
+from .scheduler import schedule_jobs, run_meeting, request_stop_active
 from .tg_commands import run_bot
 from .link_updater import scrape_and_update
 from .live import get_any_page
@@ -234,9 +234,24 @@ async def main():
             f"Выйду в {end.strftime('%H:%M')} (остаток ~{dur} мин)."
         )
 
+    async def disconnect_cb() -> str:
+        names = request_stop_active()
+        if not names:
+            return "ℹ️ Сейчас нет активных подключений."
+        stopped = "\n".join(f"• {n}" for n in names)
+        return f"⏹️ Останавливаю встречи:\n{stopped}"
+
     # стартуем Telegram-бота
     bot_task = asyncio.create_task(
-        run_bot(cfg, reload_cb, screenshot_cb, dmami_pull_cb, connect_now_cb, logger)
+        run_bot(
+            cfg,
+            reload_cb,
+            screenshot_cb,
+            dmami_pull_cb,
+            connect_now_cb,
+            disconnect_cb,
+            logger,
+        )
     )
 
     try:
