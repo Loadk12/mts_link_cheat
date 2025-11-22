@@ -436,9 +436,9 @@ async def run_bot(
     while True:
         try:
             url = f"https://api.telegram.org/bot{token}/getUpdates"
-            params = {"timeout": 50, "offset": offset}
+            params = {"timeout": 20, "offset": offset}
             async with aiohttp.ClientSession() as s:
-                async with s.get(url, params=params, timeout=60) as r:
+                async with s.get(url, params=params, timeout=30) as r:
                     data = await r.json()
             if not data.get("ok"):
                 await asyncio.sleep(3)
