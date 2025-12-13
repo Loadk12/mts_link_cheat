@@ -115,7 +115,17 @@ async def _run_meeting_attempt(
         set_page(name, page)
 
         await page.goto(url, wait_until="domcontentloaded")
-        if join_cfg:
+        already_joined = False
+        try:
+            already_joined = await page_is_healthy(page, hc_cfg)
+            if already_joined:
+                logger.info(
+                    f"[{name}] похоже, уже в встрече — пропускаю шаги join."
+                )
+        except Exception as e:
+            logger.warning(f"[{name}] healthcheck перед join не сработал: {e}")
+
+        if join_cfg and not already_joined:
             await perform_join(page, join_cfg)
         try:
             await ensure_media_disabled(page)
