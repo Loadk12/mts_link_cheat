@@ -1,23 +1,13 @@
 # -*- coding: utf-8 -*-
-"""
-Скрапер rasp.dmami.ru для группового расписания:
- - вводит номер группы «реактивно» (нативный сеттер + события),
- - кликает появившуюся кнопку группы,
- - автоскроллит, ждёт дорисовку,
- - собирает все my.mts-link.ru-ссылки с временем, названием и днём недели.
-
-Работает без куков/логина. Можно headless.
-"""
-
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import Page, async_playwright
 
 try:
     from .settings import get_logs_dir
@@ -25,7 +15,7 @@ except ImportError:
     from nts_autojoin.settings import get_logs_dir
 
 DMAMI = "https://rasp.dmami.ru"
-TIME_RE = re.compile(r"(\d{1,2}:\d{2})\s*[–—-]\s*(\d{1,2}:\d{2})")
+TIME_RE = re.compile(r"(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})")
 
 
 @dataclass
@@ -34,19 +24,20 @@ class WebEvent:
     start: str
     end: str
     title: str
-    href: str
+    href: str = ""
     lesson_type: str = ""
     date: str = ""
     teacher: str = ""
     room: str = ""
     raw_text: str = ""
-
-
-# ---------- helpers ----------
+    url_kind: str = "none"
+    date_range_raw: str = ""
+    start_date: str = ""
+    end_date: str = ""
+    outer_html: str = ""
 
 
 async def _react_fill_and_trigger(page: Page, selector: str, value: str) -> None:
-    """Заполняем input правильно для реактивного фронта и шлём события."""
     await page.wait_for_selector(selector, timeout=10_000)
     await page.click(selector, timeout=10_000)
     await page.evaluate(
@@ -68,7 +59,6 @@ async def _react_fill_and_trigger(page: Page, selector: str, value: str) -> None
 async def _auto_scroll(
     page: Page, max_steps: int = 20, step_px: int = 900, pause_ms: int = 300
 ) -> None:
-    """Проматываем вниз/вверх, чтобы ленивые блоки дорисовались."""
     for _ in range(max_steps):
         await page.mouse.wheel(0, step_px)
         await page.wait_for_timeout(pause_ms)
@@ -77,23 +67,40 @@ async def _auto_scroll(
         await page.wait_for_timeout(pause_ms)
 
 
-def _split_time(t: str) -> tuple[str, str]:
-    t = (t or "").strip()
-    m = TIME_RE.search(t)
-    if not m:
+def _split_time(value: str) -> tuple[str, str]:
+    match = TIME_RE.search((value or "").strip())
+    if not match:
         return "", ""
-    return m.group(1), m.group(2)
+    return match.group(1), match.group(2)
 
 
-# ---------- public API ----------
+def _url_kind(url: str) -> str:
+    if not url:
+        return "none"
+    return "mts_link" if "my.mts-link.ru" in url.lower() else "external_link"
+
+
+async def _save_debug_artifacts(page: Page, prefix: str, screenshot: bool) -> Dict[str, str]:
+    logs_dir = get_logs_dir()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    html_path = logs_dir / f"{prefix}.html"
+    png_path = logs_dir / f"{prefix}.png"
+    html_path.write_text(await page.content(), encoding="utf-8", errors="ignore")
+    out = {"html": str(html_path)}
+    if screenshot:
+        await page.screenshot(path=str(png_path), full_page=True)
+        out["png"] = str(png_path)
+    return out
 
 
 async def fetch_dmami(
-    group: str, *, headless: bool = True, chrome: Optional[str] = None
+    group: str,
+    *,
+    headless: bool = True,
+    chrome: Optional[str] = None,
+    debug: bool = False,
+    debug_prefix: Optional[str] = None,
 ) -> List[WebEvent]:
-    """
-    Скрапит расписание для группы и возвращает список WebEvent.
-    """
     group = (group or "").strip()
     if not group:
         raise ValueError("group must be non-empty")
@@ -107,79 +114,147 @@ async def fetch_dmami(
             if headless:
                 launch["args"] = ["--headless=new"]
         else:
-            # попытаться использовать системный Chrome, если есть
             launch["channel"] = "chrome"
             if headless:
                 launch["args"] = ["--headless=new"]
 
-        # надёжный запуск Chromium/Chrome
         try:
             browser = await pw.chromium.launch(**launch)
         except Exception:
-            # запасной вариант — дефолтный Chromium
             browser = await pw.chromium.launch(headless=headless)
 
         context = await browser.new_context(viewport={"width": 1400, "height": 900})
         page = await context.new_page()
 
         try:
-            # 1) главная и ввод группы
             await page.goto(DMAMI, wait_until="domcontentloaded", timeout=60_000)
             await _react_fill_and_trigger(page, "input.groups", group)
-
-            # 2) ждём и кликаем найденную группу
             group_btn = f'.found-groups .group[id="{group}"]'
             await page.wait_for_selector(group_btn, timeout=7_000)
             await page.click(group_btn)
 
-            # 3) ждём расписание и даём фронту дорисоваться
             await page.wait_for_selector(".schedule-day", timeout=30_000)
-            await page.wait_for_timeout(800)
-            await _auto_scroll(page, max_steps=22, step_px=1000, pause_ms=250)
+            await page.wait_for_timeout(1000)
+            await _auto_scroll(page, max_steps=24, step_px=1000, pause_ms=250)
 
-            # 4) снимаем данные: все ссылки my.mts-link.ru
+            if debug_prefix:
+                await _save_debug_artifacts(page, debug_prefix, screenshot=debug)
+
             raw_items: List[Dict[str, str]] = await page.evaluate(
                 """() => {
-                    return Array.from(document.querySelectorAll("a[href*='my.mts-link.ru']")).map(a => {
-                      const pair  = a.closest('.pair') || a.closest('.schedule-lesson');
-                      const timeEl  = pair?.querySelector('.time');
-                      const time  = timeEl?.textContent?.trim() || '';
-                      const titleEl = pair?.querySelector('.bold.small') || pair?.querySelector('.discipline-name');
-                      const title = titleEl?.textContent?.trim() || '';
-                      const typeEl = pair?.querySelector('.lesson-type, .type, .kind');
-                      const lesson_type = typeEl?.textContent?.trim() || '';
-                      const teacherEl = pair?.querySelector('.teacher, .lecturer');
-                      const teacher = teacherEl?.textContent?.trim() || '';
-                      const roomEl = pair?.querySelector('.room, .auditory, .auditorium');
-                      const room = roomEl?.textContent?.trim() || '';
-                      const dayRoot = a.closest('.schedule-day') || pair?.closest('.schedule-day');
-                      const dayEl = dayRoot?.querySelector('.schedule-day__title');
-                      const day   = dayEl?.textContent?.trim() || '';
-                      const raw_text = pair?.textContent?.replace(/\\s+/g, ' ').trim() || '';
-                      return { day, time, title, href: a.href, lesson_type, teacher, room, raw_text };
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                    const timeRe = /(\\d{1,2}:\\d{2})\\s*[-–—]\\s*(\\d{1,2}:\\d{2})/;
+                    const dateRe = /\\d{1,2}\\s*[А-Яа-яЁё]{3,}\\s*[-–—]\\s*\\d{1,2}\\s*[А-Яа-яЁё]{3,}(?:\\s*\\d{4})?/;
+                    const titleSelectors = [
+                      '.bold.small', '.discipline-name', '.lesson-title',
+                      '.subject', '.title', '[class*="discipline"]'
+                    ];
+                    const typeSelectors = ['.lesson-type', '.type', '.kind', '[class*="type"]'];
+                    const teacherSelectors = ['.teacher', '.lecturer', '[class*="teacher"]'];
+                    const roomSelectors = ['.room', '.auditory', '.auditorium', '[class*="auditor"]'];
+                    const lessonSelectors = [
+                      '.schedule-lesson', '.lesson', '[class*="lesson"]'
+                    ];
+                    const pairSelectors = ['.pair', '.schedule-pair', '[class*="pair"]'];
+
+                    const pick = (root, selectors) => {
+                      for (const sel of selectors) {
+                        const el = root?.querySelector?.(sel);
+                        const text = norm(el?.textContent || '');
+                        if (text) return text;
+                      }
+                      return '';
+                    };
+
+                    const dayTitle = (root) => {
+                      const dayRoot = root.closest('.schedule-day') || root.closest('[class*="schedule-day"]');
+                      const el = dayRoot?.querySelector('.schedule-day__title, [class*="day__title"], [class*="day-title"]');
+                      return norm(el?.textContent || dayRoot?.querySelector('h2,h3,h4')?.textContent || '');
+                    };
+
+                    const cards = new Set();
+                    for (const sel of lessonSelectors) {
+                      document.querySelectorAll(sel).forEach((el) => {
+                        const pair = el.closest(pairSelectors.join(','));
+                        const pairText = norm(pair?.textContent || '');
+                        if (timeRe.test(pairText)) cards.add(el);
+                      });
+                    }
+                    for (const sel of pairSelectors) {
+                      document.querySelectorAll(sel).forEach((el) => {
+                        if (!el.querySelector(lessonSelectors.join(',')) && timeRe.test(norm(el.textContent))) {
+                          cards.add(el);
+                        }
+                      });
+                    }
+                    document.querySelectorAll('.schedule-day, [class*="schedule-day"]').forEach((day) => {
+                      day.querySelectorAll('*').forEach((el) => {
+                        const text = norm(el.textContent);
+                        if (!timeRe.test(text)) return;
+                        const card = el.closest(lessonSelectors.join(',')) || el.closest(pairSelectors.join(',')) || el;
+                        cards.add(card);
+                      });
+                    });
+
+                    return Array.from(cards).map((card) => {
+                      const text = norm(card.textContent);
+                      const pair = card.closest(pairSelectors.join(','));
+                      const timeText = norm(pair?.querySelector('.time, [class*="time"]')?.textContent || card.querySelector('.time, [class*="time"]')?.textContent || text);
+                      const m = timeText.match(timeRe) || text.match(timeRe);
+                      const link = Array.from(card.querySelectorAll('a[href]')).find((a) => /^https?:/i.test(a.href));
+                      const href = link?.href || '';
+                      const dateMatch = text.match(dateRe);
+                      let title = pick(card, titleSelectors);
+                      if (!title) {
+                        title = text
+                          .replace(timeRe, ' ')
+                          .replace(dateRe, ' ')
+                          .split(/(?:преподаватель|аудитория|каб|онлайн|http)/i)[0]
+                          .trim();
+                      }
+                      return {
+                        day: dayTitle(card),
+                        time: m ? `${m[1]}-${m[2]}` : '',
+                        title,
+                        href,
+                        lesson_type: pick(card, typeSelectors),
+                        teacher: pick(card, teacherSelectors),
+                        room: pick(card, roomSelectors),
+                        date_range_raw: dateMatch ? dateMatch[0] : '',
+                        raw_text: text,
+                        outer_html: card.outerHTML || ''
+                      };
                     });
                 }"""
             )
 
-            for it in raw_items:
-                start, end = _split_time(it.get("time", ""))
-                title = (it.get("title") or "").strip()
-                href = (it.get("href") or "").strip()
-                day = (it.get("day") or "").strip()
-                if href and title and start and end:
-                    events.append(
-                        WebEvent(
-                            day=day,
-                            start=start,
-                            end=end,
-                            title=title,
-                            href=href,
-                            lesson_type=(it.get("lesson_type") or "").strip(),
-                            teacher=(it.get("teacher") or "").strip(),
-                            room=(it.get("room") or "").strip(),
-                            raw_text=(it.get("raw_text") or "").strip(),
-                        )
+            seen: set[tuple[str, str, str, str]] = set()
+            for item in raw_items:
+                start, end = _split_time(item.get("time", ""))
+                title = (item.get("title") or "").strip()
+                day = (item.get("day") or "").strip()
+                href = (item.get("href") or "").strip()
+                date_range_raw = (item.get("date_range_raw") or "").strip()
+                key = (day, start, end, title, href, date_range_raw)
+                if not day or not title or not start or not end or key in seen:
+                    continue
+                seen.add(key)
+                events.append(
+                    WebEvent(
+                        day=day,
+                        start=start,
+                        end=end,
+                        title=title,
+                        href=href,
+                        lesson_type=(item.get("lesson_type") or "").strip(),
+                        teacher=(item.get("teacher") or "").strip(),
+                        room=(item.get("room") or "").strip(),
+                        raw_text=(item.get("raw_text") or "").strip(),
+                        url_kind=_url_kind(href),
+                        date_range_raw=date_range_raw,
+                        outer_html=(item.get("outer_html") or "").strip(),
                     )
+                )
         finally:
             await context.close()
             await browser.close()
@@ -188,56 +263,49 @@ async def fetch_dmami(
 
 
 def to_yaml(events: List[WebEvent]) -> str:
-    """
-    Утилита: конвертировать список WebEvent в YAML-фрагмент для meetings.
-    """
-    import yaml  # локальный импорт, чтобы не тянуть в CLI, если не нужен
+    import yaml
 
-    arr: List[Dict[str, Any]] = []
-    for e in events:
-        arr.append(
-            {
-                "name": e.title,
-                "url": e.href,
-                "hint_time": f"{e.day} {e.start}-{e.end}",
-            }
-        )
-    return yaml.safe_dump(arr, allow_unicode=True, sort_keys=False)
+    return yaml.safe_dump(
+        [asdict(event) for event in events], allow_unicode=True, sort_keys=False
+    )
 
-
-# ---------- CLI ----------
 
 if __name__ == "__main__":
     import argparse
     import asyncio
-
-    get_logs_dir().mkdir(parents=True, exist_ok=True)
+    import sys
+    from datetime import datetime
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--group", required=True, help="Номер группы, например: 231-363")
-    ap.add_argument(
-        "--headless", action="store_true", help="Запуск без окна браузера"
-    )
-    ap.add_argument(
-        "--chrome",
-        default=None,
-        help="Путь к chrome.exe / chrome (если нужен строго системный)",
-    )
-    ap.add_argument("--out", default=None, help="Куда сохранить JSON")
+    ap.add_argument("--group", required=True)
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--no-headless", action="store_true")
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--chrome", default=None)
+    ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    headless = args.headless and not args.no_headless
+    if args.no_headless:
+        headless = False
+    prefix = f"dmami_page_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     evs = asyncio.run(
-        fetch_dmami(args.group, headless=args.headless, chrome=args.chrome)
+        fetch_dmami(
+            args.group,
+            headless=headless,
+            chrome=args.chrome,
+            debug=args.debug,
+            debug_prefix=prefix if args.debug else None,
+        )
     )
-    print(f"Найдено ссылок: {len(evs)}")
+    print(f"Found lesson cards: {len(evs)}")
 
-    data_path = Path(args.out) if args.out else get_logs_dir() / "dmami_links.json"
-    data_path.parent.mkdir(parents=True, exist_ok=True)
-    data_path.write_text(
+    out_path = Path(args.out) if args.out else get_logs_dir() / "dmami_cards.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
         json.dumps([asdict(e) for e in evs], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(f"JSON сохранён: {data_path}")
-
-    print("\n--- YAML фрагмент ---")
-    print(to_yaml(evs))
+    print(f"JSON saved: {out_path}")
+    sys.stdout.buffer.write(to_yaml(evs).encode("utf-8", errors="replace"))
+    sys.stdout.buffer.write(b"\n")

@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
 from .dmami_scraper import WebEvent, fetch_dmami
 from .settings import get_generated_config_path, get_logs_dir
-
 
 DAY_ALIASES = {
     "mon": ("mon", "monday", "пн", "понедельник"),
@@ -21,14 +20,21 @@ DAY_ALIASES = {
     "sat": ("sat", "saturday", "сб", "суббота"),
     "sun": ("sun", "sunday", "вс", "воскресенье"),
 }
-
 LESSON_TYPES = {
     "lecture": ("лек", "лекция", "lecture"),
     "practice": ("прак", "практика", "семинар", "seminar", "practice"),
     "lab": ("лаб", "лаборатор", "lab"),
 }
-
-DATE_RE = re.compile(r"(?P<day>\d{1,2})[./](?P<month>\d{1,2})(?:[./](?P<year>\d{2,4}))?")
+MONTHS = {
+    "янв": 1, "фев": 2, "мар": 3, "апр": 4, "май": 5, "мая": 5, "июн": 6,
+    "июл": 7, "авг": 8, "сен": 9, "сент": 9, "окт": 10, "ноя": 11, "дек": 12,
+}
+MONTH_RE = r"Янв|Фев|Мар|Апр|Май|Мая|Июн|Июл|Авг|Сен|Сент|Окт|Ноя|Дек"
+RANGE_RE = re.compile(
+    rf"(?P<d1>\d{{1,2}})\s*(?P<m1>{MONTH_RE})\.?\s*[-–—]\s*"
+    rf"(?P<d2>\d{{1,2}})\s*(?P<m2>{MONTH_RE})\.?(?:\s*(?P<y2>\d{{4}}))?",
+    re.UNICODE | re.IGNORECASE,
+)
 
 
 def normalize_title(value: str) -> str:
@@ -47,7 +53,7 @@ def normalize_weekday(value: str) -> str:
 
 
 def normalize_lesson_type(value: str, title: str = "", raw_text: str = "") -> str:
-    text = normalize_title(" ".join([value or "", title or "", raw_text or ""]))
+    text = normalize_title(" ".join([value or "", title or ""]))
     for key, aliases in LESSON_TYPES.items():
         if any(alias in text for alias in aliases):
             return key
@@ -55,53 +61,53 @@ def normalize_lesson_type(value: str, title: str = "", raw_text: str = "") -> st
 
 
 def display_lesson_type(value: str) -> str:
-    return {
-        "lecture": "Лекция",
-        "practice": "Практика",
-        "lab": "Лаб. работа",
-    }.get(value, "")
+    return {"lecture": "Лекция", "practice": "Практика", "lab": "Лаб. работа"}.get(value, "")
+
+
+def parse_russian_month(value: str) -> Optional[int]:
+    text = normalize_title(value).replace(".", "")
+    return MONTHS.get(text[:4]) or MONTHS.get(text[:3])
+
+
+def parse_dmami_date_range(raw: str, reference_date: date | datetime | None = None) -> Tuple[Optional[date], Optional[date]]:
+    ref = reference_date.date() if isinstance(reference_date, datetime) else (reference_date or date.today())
+    match = RANGE_RE.search(raw or "")
+    if not match:
+        return None, None
+    start_month = parse_russian_month(match.group("m1"))
+    end_month = parse_russian_month(match.group("m2"))
+    if not start_month or not end_month:
+        return None, None
+    start_year = int(match.group("y2")) if match.group("y2") else ref.year
+    if not match.group("y2") and ref.month <= 2 and start_month >= 9:
+        start_year -= 1
+    end_year = start_year + (1 if end_month < start_month else 0)
+    try:
+        return date(start_year, start_month, int(match.group("d1"))), date(end_year, end_month, int(match.group("d2")))
+    except ValueError:
+        return None, None
+
+
+def is_date_in_range(day: date, start_date: date | None, end_date: date | None) -> bool:
+    return not ((start_date and day < start_date) or (end_date and day > end_date))
 
 
 def dmami_key(event: WebEvent) -> str:
-    title = normalize_title(event.title)
     lesson_type = normalize_lesson_type(event.lesson_type, event.title, event.raw_text)
-    weekday = normalize_weekday(event.day)
-    parts = [title]
+    parts = [normalize_title(event.title)]
     if lesson_type:
         parts.append(lesson_type)
-    parts.extend([weekday, event.start])
+    parts.extend([normalize_weekday(event.day), event.start])
     return "|".join(part for part in parts if part)
-
-
-def _parse_event_date(event: WebEvent, cfg: Dict[str, Any]) -> str:
-    if event.date:
-        return str(event.date)
-    source = " ".join([event.day or "", event.raw_text or ""])
-    match = DATE_RE.search(source)
-    if not match:
-        return ""
-    day = int(match.group("day"))
-    month = int(match.group("month"))
-    year_raw = match.group("year")
-    if year_raw:
-        year = int(year_raw)
-        if year < 100:
-            year += 2000
-    else:
-        year = int((cfg.get("dmami") or {}).get("academic_year") or datetime.now().year)
-    try:
-        return datetime(year, month, day).strftime("%Y-%m-%d")
-    except ValueError:
-        return ""
 
 
 def _duration_minutes(start: str, end: str) -> int:
     try:
         sh, sm = [int(x) for x in start.split(":", 1)]
         eh, em = [int(x) for x in end.split(":", 1)]
+        return max(1, (eh * 60 + em) - (sh * 60 + sm))
     except Exception:
         return 90
-    return max(1, (eh * 60 + em) - (sh * 60 + sm))
 
 
 def _cron(start: str, weekday: str) -> str:
@@ -109,70 +115,82 @@ def _cron(start: str, weekday: str) -> str:
     return f"{minute} {hour} * * {weekday}"
 
 
+def _url_kind(url: str | None) -> str:
+    if not url:
+        return "none"
+    return "mts_link" if "my.mts-link.ru" in url.lower() else "external_link"
+
+
+def _meeting_mode(event: WebEvent, url: str | None) -> str:
+    if _url_kind(url) == "mts_link":
+        return "online_auto"
+    if url:
+        return "online_manual"
+    if event.room:
+        return "offline"
+    return "online_manual"
+
+
 def _meeting_name(event: WebEvent) -> str:
     lesson_type = normalize_lesson_type(event.lesson_type, event.title, event.raw_text)
-    display_type = display_lesson_type(lesson_type)
-    return f"{event.title} ({display_type})" if display_type else event.title
+    label = display_lesson_type(lesson_type)
+    if label and label.lower() not in event.title.lower():
+        return f"{event.title} ({label})"
+    return event.title
 
 
 def build_generated_meetings(
-    events: Iterable[WebEvent], cfg: Dict[str, Any]
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    events: Iterable[WebEvent], cfg: Dict[str, Any], reference_date: date | None = None
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    ref = reference_date or datetime.now().date()
     grouped: Dict[str, List[WebEvent]] = {}
     skipped: List[Dict[str, Any]] = []
-
+    warnings: List[str] = []
     for event in events:
         key = dmami_key(event)
-        weekday = normalize_weekday(event.day)
-        if not key or not weekday or not event.start or not event.end or not event.href:
-            skipped.append({"event": asdict(event), "reason": "missing key/time/url"})
+        if not key or not normalize_weekday(event.day) or not event.start or not event.end:
+            skipped.append({"event": asdict(event), "reason": "missing key/time"})
             continue
         grouped.setdefault(key, []).append(event)
 
-    dmami_cfg = cfg.get("dmami") or {}
-    default_start = dmami_cfg.get("default_start_date")
-    default_end = dmami_cfg.get("default_end_date")
-
     meetings: List[Dict[str, Any]] = []
+    defaults = cfg.get("dmami") or {}
     for key, items in sorted(grouped.items(), key=lambda item: item[0]):
         first = items[0]
+        ranges = [parse_dmami_date_range(e.date_range_raw or e.raw_text, ref) for e in items]
+        starts = [s for s, _e in ranges if s]
+        ends = [e for _s, e in ranges if e]
+        start_text = min(starts).isoformat() if starts else defaults.get("default_start_date")
+        end_text = max(ends).isoformat() if ends else defaults.get("default_end_date")
+        if not start_text or not end_text:
+            warnings.append(f"date range not detected: {first.title} {first.day} {first.start}")
+        url = next((e.href for e in reversed(items) if e.href), None)
         weekday = normalize_weekday(first.day)
-        dates = sorted({d for d in (_parse_event_date(e, cfg) for e in items) if d})
-        urls = [e.href for e in items if e.href]
-        url = urls[-1] if urls else first.href
-        meeting: Dict[str, Any] = {
+        lesson_type = normalize_lesson_type(first.lesson_type, first.title, first.raw_text)
+        meetings.append({
             "name": _meeting_name(first),
             "url": url,
             "cron": _cron(first.start, weekday),
             "duration_minutes": _duration_minutes(first.start, first.end),
+            "start_date": start_text,
+            "end_date": end_text,
             "dmami_key": key,
+            "source": "dmami",
+            "meeting_mode": _meeting_mode(first, url),
             "dmami": {
                 "title": first.title,
-                "lesson_type": normalize_lesson_type(
-                    first.lesson_type, first.title, first.raw_text
-                ),
+                "lesson_type": lesson_type,
                 "weekday": weekday,
                 "start": first.start,
                 "end": first.end,
+                "date_range_raw": first.date_range_raw,
                 "teacher": first.teacher,
                 "room": first.room,
+                "url_kind": _url_kind(url),
                 "raw_text": first.raw_text,
             },
-        }
-        if dates:
-            meeting["start_date"] = min(dates)
-            meeting["end_date"] = max(dates)
-        elif default_start or default_end:
-            if default_start:
-                meeting["start_date"] = default_start
-            if default_end:
-                meeting["end_date"] = default_end
-            meeting["dmami"]["dates_source"] = "config defaults"
-        else:
-            meeting["dmami"]["dates_source"] = "not detected"
-        meetings.append(meeting)
-
-    return meetings, skipped
+        })
+    return meetings, skipped, warnings
 
 
 def _read_generated(path: Path) -> Dict[str, Any]:
@@ -182,20 +200,13 @@ def _read_generated(path: Path) -> Dict[str, Any]:
 
 
 def _index_by_key(meetings: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {
-        str(m.get("dmami_key")): m
-        for m in meetings
-        if isinstance(m, dict) and m.get("dmami_key")
-    }
+    return {str(m.get("dmami_key")): m for m in meetings if isinstance(m, dict) and m.get("dmami_key")}
 
 
 def _write_yaml_atomic(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(
-        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
+    tmp.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -204,118 +215,138 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _changes_text(
-    old: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]], skipped: List[Dict[str, Any]]
-) -> str:
-    old_keys = set(old)
-    new_keys = set(new)
+def _parse_date(value):
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date() if value else None
+    except Exception:
+        return None
+
+
+def _active_today(meeting: Dict[str, Any], today: date) -> bool:
+    return is_date_in_range(today, _parse_date(meeting.get("start_date")), _parse_date(meeting.get("end_date")))
+
+
+def _stats(events: List[WebEvent], meetings: List[Dict[str, Any]], today: date) -> Dict[str, int]:
+    return {
+        "cards_total": len(events),
+        "with_mts_link": sum(1 for e in events if _url_kind(e.href) == "mts_link"),
+        "without_link": sum(1 for e in events if not e.href),
+        "offline": sum(1 for m in meetings if m.get("meeting_mode") == "offline"),
+        "dates_detected": sum(1 for m in meetings if m.get("start_date") and m.get("end_date")),
+        "dates_missing": sum(1 for m in meetings if not (m.get("start_date") and m.get("end_date"))),
+        "generated_meetings": len(meetings),
+        "active_today": sum(1 for m in meetings if _active_today(m, today)),
+    }
+
+
+def _changes_text(old, new, skipped, warnings, stats) -> str:
+    old_keys, new_keys = set(old), set(new)
     lines = [
+        f"cards total: {stats['cards_total']}",
+        f"with MTS Link: {stats['with_mts_link']}",
+        f"without link: {stats['without_link']}",
+        f"offline: {stats['offline']}",
+        f"with date range: {stats['dates_detected']}",
+        f"without date range: {stats['dates_missing']}",
+        f"generated meetings: {stats['generated_meetings']}",
+        f"active today: {stats['active_today']}",
+        "",
         f"new keys: {len(new_keys - old_keys)}",
         f"removed keys: {len(old_keys - new_keys)}",
         f"updated urls: {sum(1 for key in old_keys & new_keys if old[key].get('url') != new[key].get('url'))}",
         f"skipped events: {len(skipped)}",
-        "",
+        f"parse warnings: {len(warnings)}",
     ]
-    for key in sorted(new_keys - old_keys):
-        lines.append(f"+ {key}")
-    for key in sorted(old_keys - new_keys):
-        lines.append(f"- {key}")
-    for key in sorted(old_keys & new_keys):
-        if old[key].get("url") != new[key].get("url"):
-            lines.append(f"~ {key}")
-    if skipped:
-        lines.append("")
-        lines.append("skipped:")
-        for item in skipped:
-            event = item.get("event") or {}
-            lines.append(f"! {item.get('reason')}: {event.get('title')} {event.get('day')} {event.get('start')}")
-    return "\n".join(lines).strip() + "\n"
+    return "\n".join(lines + [""] + [f"! {w}" for w in warnings]) + "\n"
 
 
 async def sync_dmami_schedule(cfg: Dict[str, Any], logger) -> Dict[str, Any]:
     dmami_cfg = cfg.get("dmami") or {}
     group = (dmami_cfg.get("group") or "").strip()
     if not group:
-        raise RuntimeError("В конфиге не задан dmami.group")
-
-    logger.info("[dmami] syncing generated schedule for group %s", group)
+        raise RuntimeError("dmami.group is not set")
+    now = datetime.now().astimezone()
+    today = now.date()
+    ts = now.strftime("%Y%m%d-%H%M%S")
+    page_prefix = f"dmami_page_{ts}"
     events = await fetch_dmami(
         group,
         headless=True,
         chrome=(cfg.get("chromium") or {}).get("executable_path"),
+        debug=bool(dmami_cfg.get("debug")),
+        debug_prefix=page_prefix,
     )
-    meetings, skipped = build_generated_meetings(events, cfg)
-
+    meetings, skipped, warnings = build_generated_meetings(events, cfg, today)
     generated_path = get_generated_config_path()
     previous = _read_generated(generated_path)
-    old_index = _index_by_key(previous.get("meetings") or [])
-    new_index = _index_by_key(meetings)
-
-    now = datetime.now().astimezone()
+    old_index, new_index = _index_by_key(previous.get("meetings") or []), _index_by_key(meetings)
+    stats = _stats(events, meetings, today)
     payload = {
         "generated_by": "nts_autojoin.dmami",
         "generated_at": now.isoformat(timespec="seconds"),
-        "source": {
-            "group": group,
-            "raw_events": len(events),
-            "dates_detected": any(
-                bool(m.get("start_date") or m.get("end_date")) for m in meetings
-            ),
-        },
+        "source": {"group": group, "raw_events": len(events), "dates_detected": stats["dates_detected"], "dates_missing": stats["dates_missing"]},
         "meetings": meetings,
     }
     _write_yaml_atomic(generated_path, payload)
-
     logs_dir = get_logs_dir()
-    ts = now.strftime("%Y%m%d-%H%M%S")
     raw_path = logs_dir / f"dmami_raw_{ts}.yaml"
     generated_log_path = logs_dir / f"dmami_generated_{ts}.yaml"
     changes_path = logs_dir / f"dmami_changes_{ts}.txt"
+    warnings_path = logs_dir / f"dmami_parse_warnings_{ts}.txt"
     unmatched_path = logs_dir / f"dmami_unmatched_{ts}.yaml"
-
-    _write_yaml_atomic(
-        raw_path,
-        {"events": [asdict(event) for event in events], "skipped": skipped},
-    )
+    _write_yaml_atomic(raw_path, {"events": [asdict(e) for e in events], "skipped": skipped})
     _write_yaml_atomic(generated_log_path, payload)
-    _write_text(changes_path, _changes_text(old_index, new_index, skipped))
+    _write_text(changes_path, _changes_text(old_index, new_index, skipped, warnings, stats))
+    _write_text(warnings_path, "\n".join(warnings) if warnings else "No parse warnings.\n")
     if skipped:
         _write_yaml_atomic(unmatched_path, {"skipped": skipped})
-
+    page_html_path = logs_dir / f"{page_prefix}.html"
+    page_png_path = logs_dir / f"{page_prefix}.png"
     return {
+        **stats,
         "raw_events": len(events),
-        "generated_meetings": len(meetings),
         "new_keys": len(set(new_index) - set(old_index)),
         "removed_keys": len(set(old_index) - set(new_index)),
-        "updated_urls": sum(
-            1
-            for key in set(old_index) & set(new_index)
-            if old_index[key].get("url") != new_index[key].get("url")
-        ),
+        "updated_urls": sum(1 for key in set(old_index) & set(new_index) if old_index[key].get("url") != new_index[key].get("url")),
         "skipped": len(skipped),
+        "warnings": len(warnings),
         "generated_path": str(generated_path),
         "raw_path": str(raw_path),
         "generated_log_path": str(generated_log_path),
         "changes_path": str(changes_path),
+        "warnings_path": str(warnings_path),
         "unmatched_path": str(unmatched_path) if skipped else "",
+        "page_html_path": str(page_html_path) if page_html_path.exists() else "",
+        "page_png_path": str(page_png_path) if page_png_path.exists() else "",
     }
 
 
 def format_sync_report(result: Dict[str, Any]) -> str:
     lines = [
-        "DMAMI sync завершён.",
-        f"Raw events: {result['raw_events']}",
+        "DMAMI sync finished.",
+        f"Cards found: {result['cards_total']}",
+        f"With MTS Link: {result['with_mts_link']}",
+        f"Without link: {result['without_link']}",
+        f"Offline: {result['offline']}",
+        f"With date range: {result['dates_detected']}",
+        f"Without date range: {result['dates_missing']}",
         f"Meetings generated: {result['generated_meetings']}",
+        f"Active today: {result['active_today']}",
         f"New keys: {result['new_keys']}",
         f"Removed keys: {result['removed_keys']}",
         f"Updated URLs: {result['updated_urls']}",
-        f"Skipped: {result['skipped']}",
+        f"Warnings: {result['warnings']}",
         "",
         f"Generated: {result['generated_path']}",
         f"Raw log: {result['raw_path']}",
         f"Generated log: {result['generated_log_path']}",
         f"Changes: {result['changes_path']}",
+        f"Warnings log: {result['warnings_path']}",
     ]
+    if result.get("page_html_path"):
+        lines.append(f"Page HTML: {result['page_html_path']}")
+    if result.get("page_png_path"):
+        lines.append(f"Page PNG: {result['page_png_path']}")
     if result.get("unmatched_path"):
         lines.append(f"Unmatched: {result['unmatched_path']}")
     return "\n".join(lines)

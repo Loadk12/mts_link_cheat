@@ -247,6 +247,65 @@ def _parse_cfg_date(value):
     return None
 
 
+def _meeting_active_on(meeting: Dict, day) -> bool:
+    start_date = _parse_cfg_date(
+        meeting.get("start_date")
+        or meeting.get("date_from")
+        or meeting.get("from_date")
+    )
+    end_date = _parse_cfg_date(
+        meeting.get("end_date")
+        or meeting.get("date_to")
+        or meeting.get("to_date")
+    )
+    if start_date and day < start_date:
+        return False
+    if end_date and day > end_date:
+        return False
+    return True
+
+
+def _can_auto_join(meeting: Dict) -> bool:
+    return bool(meeting.get("url")) and meeting.get("meeting_mode", "online_auto") == "online_auto"
+
+
+def _connect_template(meeting: Dict) -> str:
+    dmami = meeting.get("dmami") or {}
+    return f"/connect https://... {dmami.get('end') or 'HH:MM'}"
+
+
+async def send_meeting_reminder(
+    meeting: Dict,
+    tzname: str,
+    global_cfg: dict,
+    logger,
+    minutes_before: int,
+):
+    name = meeting.get("name", "Без названия")
+    tzinfo = _tz(tzname)
+    today = datetime.now(tzinfo).date()
+    if not _meeting_active_on(meeting, today):
+        logger.info("[%s] reminder skipped outside date range", name)
+        return
+
+    dmami = meeting.get("dmami") or {}
+    start = dmami.get("start") or "?"
+    end = dmami.get("end") or "?"
+    if minutes_before > 0:
+        prefix = f"Через {minutes_before} минут начнётся: {name}, {start}-{end}."
+    else:
+        prefix = f"Пара началась: {name}, {start}-{end}."
+
+    if meeting.get("meeting_mode") == "offline":
+        tail = f"Похоже, это очная пара. Аудитория: {dmami.get('room') or '-'}."
+    elif meeting.get("url"):
+        tail = "Автоподключение запланировано." if _can_auto_join(meeting) else "Есть ссылка, можно подключиться вручную."
+    else:
+        tail = f"Ссылки нет. Если пара онлайн, пришли ссылку командой: {_connect_template(meeting)}"
+
+    await notify(global_cfg, f"{prefix}\n{tail}")
+
+
 async def run_meeting(
     meeting: Dict,
     tzname: str,
@@ -261,7 +320,15 @@ async def run_meeting(
     входа и повторные попытки при неудаче.
     """
     name = meeting.get("name", "Безымянка")
-    url = meeting["url"]
+    url = meeting.get("url")
+    if not url or not _can_auto_join(meeting):
+        logger.info(
+            "[%s] auto-join skipped: mode=%s url=%s",
+            name,
+            meeting.get("meeting_mode"),
+            bool(url),
+        )
+        return
     duration_min = int(meeting.get("duration_minutes", 45))
     join_cfg = meeting.get("join", {}) or {}
 
@@ -381,15 +448,61 @@ def schedule_jobs(scheduler: AsyncIOScheduler, cfg: dict, logger):
 
         trigger = CronTrigger.from_crontab(cron_expr, timezone=tzinfo)
         scheduler.add_job(
-            run_meeting,
+            send_meeting_reminder,
             trigger=trigger,
-            args=[m, tzname, chromium_cfg, hc_cfg, cfg, logger],
-            name=m.get("name", m.get("url", "(no url)")),
+            args=[m, tzname, cfg, logger, 0],
+            name=f"reminder_start:{m.get('name', '(no name)')}",
             coalesce=True,
             misfire_grace_time=600,
             max_instances=1,
             replace_existing=True,
         )
+        before_expr = _shift_cron_minutes(cron_expr, -5)
+        if before_expr:
+            scheduler.add_job(
+                send_meeting_reminder,
+                trigger=CronTrigger.from_crontab(before_expr, timezone=tzinfo),
+                args=[m, tzname, cfg, logger, 5],
+                name=f"reminder_5m:{m.get('name', '(no name)')}",
+                coalesce=True,
+                misfire_grace_time=600,
+                max_instances=1,
+                replace_existing=True,
+            )
+        if _can_auto_join(m):
+            scheduler.add_job(
+                run_meeting,
+                trigger=trigger,
+                args=[m, tzname, chromium_cfg, hc_cfg, cfg, logger],
+                name=m.get("name", m.get("url", "(no url)")),
+                coalesce=True,
+                misfire_grace_time=600,
+                max_instances=1,
+                replace_existing=True,
+            )
         logger.info(
             f"Запланировано: {m.get('name','(no name)')} @ {cron_expr} [{tzname}]"
         )
+
+
+def _shift_cron_minutes(cron_expr: str, delta_minutes: int) -> str | None:
+    parts = (cron_expr or "").split()
+    if len(parts) != 5:
+        return None
+    try:
+        minute = int(parts[0])
+        hour = int(parts[1])
+    except Exception:
+        return None
+    day = parts[4].lower()
+    weekdays = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    total = hour * 60 + minute + delta_minutes
+    if total < 0:
+        total += 24 * 60
+        if day in weekdays:
+            day = weekdays[(weekdays.index(day) - 1) % 7]
+    elif total >= 24 * 60:
+        total -= 24 * 60
+        if day in weekdays:
+            day = weekdays[(weekdays.index(day) + 1) % 7]
+    return f"{total % 60} {total // 60} {parts[2]} {parts[3]} {day}"

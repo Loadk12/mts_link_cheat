@@ -51,6 +51,29 @@ def _meeting_active_on(m: dict, day) -> bool:
     return True
 
 
+def _meeting_mode_label(m: dict) -> str:
+    mode = m.get("meeting_mode") or "unknown"
+    return {
+        "online_auto": "Auto",
+        "online_manual": "Manual",
+        "offline": "Offline",
+        "unknown": "Unknown",
+    }.get(mode, mode)
+
+
+def _date_range_label(m: dict) -> str:
+    start = m.get("start_date")
+    end = m.get("end_date")
+    if start and end:
+        return f"{start}..{end}"
+    return "без дат"
+
+
+def _connect_hint(m: dict) -> str:
+    dmami = m.get("dmami") or {}
+    return f"/connect https://... {dmami.get('end') or 'HH:MM'}"
+
+
 def _occurrences_today(cron_expr: str, tzinfo) -> List[datetime]:
     trig = CronTrigger.from_crontab(cron_expr, timezone=tzinfo)
     now = datetime.now(tzinfo)
@@ -258,7 +281,9 @@ def _today_summary(cfg: dict) -> str:
     for dt, m in items:
         name = m.get("name", "Без названия")
         dur = int(m.get("duration_minutes", 45))
-        lines.append(f"• {dt.strftime('%H:%M')} — {name} ({dur} мин)")
+        lines.append(
+            f"• {dt.strftime('%H:%M')} — {name} ({dur} мин, {_meeting_mode_label(m)}, {_date_range_label(m)})"
+        )
     return "\n".join(lines)
 
 
@@ -366,6 +391,39 @@ def _render_today(cfg: dict) -> str:
         lines.append(
             f"• {start.strftime('%H:%M')}-{end.strftime('%H:%M')} "
             f"{meeting.get('name', 'Без названия')} — {status}"
+        )
+    return "\n".join(lines)
+
+def _render_today(cfg: dict) -> str:
+    tzinfo = _tz(cfg)
+    now = datetime.now(tzinfo)
+    items = []
+    for meeting in cfg.get("meetings", []) or []:
+        if not _meeting_active_on(meeting, now.date()):
+            continue
+        cron = meeting.get("cron")
+        if not cron:
+            continue
+        for start in _occurrences_today(cron, tzinfo):
+            duration = int(meeting.get("duration_minutes", 45))
+            end = start + timedelta(minutes=duration)
+            if end < now:
+                status = "прошла"
+            elif start <= now <= end:
+                status = "идёт сейчас"
+            else:
+                status = "будет"
+            items.append((start, end, meeting, status))
+
+    lines = [f"Сегодня, {now.strftime('%d.%m.%Y')}"]
+    if not items:
+        lines.append("Пар на сегодня нет.")
+        return "\n".join(lines)
+    for start, end, meeting, status in sorted(items, key=lambda item: item[0]):
+        lines.append(
+            f"• {start.strftime('%H:%M')}-{end.strftime('%H:%M')} "
+            f"{meeting.get('name', 'Без названия')} — {status}; "
+            f"{_meeting_mode_label(meeting)}; {_date_range_label(meeting)}"
         )
     return "\n".join(lines)
 
@@ -532,6 +590,14 @@ async def run_bot(
             await _send(cfg, "Сейчас нет активной пары.", chat_id)
             return
         meeting, _start, _end = current
+        if not meeting.get("url"):
+            await _send(
+                cfg,
+                f"Сейчас идёт пара без ссылки: {meeting.get('name','Без названия')}.\n"
+                f"Если она онлайн, пришли ссылку командой: {_connect_hint(meeting)}",
+                chat_id,
+            )
+            return
         now = datetime.now(_tz(cfg))
         msg = await connect_cb(
             meeting["url"],
@@ -714,6 +780,26 @@ async def run_bot(
                 await send_reply(f"📷 Не смог снять десктоп: {e}")
             return
 
+        if cmd == "/link":
+            if is_stale:
+                await send_reply("Игнорирую старую команду /link.")
+                return
+            url = parts[1].strip() if len(parts) > 1 else ""
+            if not re.match(r"^https?://\S+$", url, re.I):
+                await send_reply("Использование: /link <url>")
+                return
+            pick = _pick_current_meeting(_load_cfg())
+            if not pick:
+                await send_reply("Сейчас нет активной пары для этой ссылки.")
+                return
+            meeting, _start, end = pick
+            if meeting.get("url"):
+                await send_reply("У текущей пары уже есть ссылка. Используй /connect <url> HH:MM, если нужна другая.")
+                return
+            msg = await connect_cb(url, end.hour, end.minute, int(meeting.get("duration_minutes", 90)))
+            await send_reply(msg)
+            return
+
         if cmd == "/connect":
             if is_stale:
                 await send_reply("⏭️ Игнорирую старую команду /connect.")
@@ -754,6 +840,12 @@ async def run_bot(
                     await send_reply("Не нашёл подходящую встречу в расписании.")
                     return
                 m, start, end = pick
+                if not m.get("url"):
+                    await send_reply(
+                        f"Сейчас идёт пара без ссылки: {m.get('name','Без названия')}.\n"
+                        f"Пришли ссылку командой: {_connect_hint(m)}"
+                    )
+                    return
                 msg = await connect_cb(m["url"], hh, mm, dur)
                 await send_reply(msg)
                 return
@@ -766,6 +858,12 @@ async def run_bot(
                 )
                 return
             m, start, end = pick
+            if not m.get("url"):
+                await send_reply(
+                    f"Сейчас идёт пара без ссылки: {m.get('name','Без названия')}.\n"
+                    f"Пришли ссылку командой: {_connect_hint(m)}"
+                )
+                return
             now = datetime.now(tzinfo)
             msg = await connect_cb(
                 m["url"], now.hour, now.minute, int(m.get("duration_minutes", 90))
