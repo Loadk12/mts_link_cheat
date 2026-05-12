@@ -2,8 +2,8 @@ timezone: Europe/Moscow
 dmami:
   group: 231-363
 notify:
-  telegram_bot_token: 1018001263:AAESkHxau1iA4anN2UzaMshZtLziF5Hc8RY
-  telegram_chat_id: '517738418'
+  telegram_bot_token: null
+  telegram_chat_id: null
   on_start_summary: true
   daily_summary: true
   daily_summary_hour: 7
@@ -20,8 +20,8 @@ chromium:
   extra_args:
   - --use-fake-device-for-media-stream
   - --use-fake-ui-for-media-stream
-  - --use-file-for-fake-video-capture=C:\Users\Administrator\Desktop\mts-link-cheat\assets\black.y4m
-  - --use-file-for-fake-audio-capture=C:\Users\Administrator\Desktop\mts-link-cheat\assets\silence.wav
+  - --use-file-for-fake-video-capture=assets\black.y4m
+  - --use-file-for-fake-audio-capture=assets\silence.wav
   - --autoplay-policy=no-user-gesture-required
 healthcheck:
   every_minutes: 5

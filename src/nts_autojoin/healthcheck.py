@@ -62,10 +62,13 @@ async def page_is_healthy(page, hc_cfg: dict) -> bool:
     js = HEALTH_JS.replace("__INDICATOR_SELECTORS__", json.dumps(selector_values))
     try:
         res = await page.evaluate(js)
-        ok = False
-        if selector_values and res.get("selector_ok"): ok = True
-        if want_ws and res.get("ws_open"): ok = True
-        if want_webrtc and res.get("webrtc_active"): ok = True
-        return ok
+        strong_configured = bool(selector_values or want_webrtc)
+        strong_ok = False
+        if selector_values and res.get("selector_ok"): strong_ok = True
+        if want_webrtc and res.get("webrtc_active"): strong_ok = True
+        if strong_configured:
+            return strong_ok
+        if want_ws and res.get("ws_open"): return True
+        return False
     except Exception:
         return False

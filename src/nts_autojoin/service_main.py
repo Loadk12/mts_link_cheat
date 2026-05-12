@@ -11,7 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dateutil import tz
 
-from .settings import load_config
+from .settings import get_logs_dir, load_config
 from .logging_setup import setup_logger
 from .power import keep_awake, on_ac_power
 from .notifier import notify
@@ -163,10 +163,10 @@ async def main():
                 return None
             tzinfo = tz.gettz(cfg.get("timezone", "Europe/Moscow"))
             ts = datetime.now(tzinfo).strftime("%Y%m%d-%H%M%S")
-            Path("logs").mkdir(parents=True, exist_ok=True)
-            path = f"logs/tg_shot_{ts}.png"
-            await page.screenshot(path=path, full_page=True)
-            return path
+            path = get_logs_dir() / f"tg_shot_{ts}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path=str(path), full_page=True)
+            return str(path)
         except Exception:
             return None
 

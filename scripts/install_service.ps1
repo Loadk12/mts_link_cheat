@@ -11,9 +11,15 @@ if (-not $nssm) {
   if (Test-Path $localNssm) { $nssm = $localNssm } else { Write-Error "nssm.exe не найден. Положи в scripts\\nssm.exe или добавь в PATH." }
 } else { $nssm = $nssm.Source }
 $workdir = (Get-Location).Path
-$python = Resolve-Path $PythonPath
-& $nssm install $ServiceName $python "$workdir\ -m $ModuleEntry"
+$python = (Resolve-Path $PythonPath).Path
+New-Item -ItemType Directory -Force -Path (Join-Path $workdir "logs") | Out-Null
+$service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if (-not $service) {
+  & $nssm install $ServiceName $python
+}
+& $nssm set $ServiceName Application $python
 & $nssm set $ServiceName AppDirectory $workdir
+& $nssm set $ServiceName AppParameters "-m $ModuleEntry"
 & $nssm set $ServiceName Start SERVICE_AUTO_START
 & $nssm set $ServiceName AppStdout "$workdir\logs\service_stdout.log"
 & $nssm set $ServiceName AppStderr "$workdir\logs\service_stderr.log"

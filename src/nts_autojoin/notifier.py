@@ -1,4 +1,5 @@
 import aiohttp
+from pathlib import Path
 
 def _tg(cfg):
     n = cfg.get("notify") or {}
@@ -26,10 +27,11 @@ async def send_document(cfg, file_path: str, caption: str = ""):
     form.add_field("chat_id", str(chat))
     if caption:
         form.add_field("caption", caption)
-    form.add_field("document", open(file_path, "rb"), filename=file_path.split("/")[-1])
-    async with aiohttp.ClientSession() as s:
-        async with s.post(url, data=form, timeout=120) as r:
-            await r.text()
+    with open(file_path, "rb") as fh:
+        form.add_field("document", fh, filename=Path(file_path).name)
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, data=form, timeout=120) as r:
+                await r.text()
 
 async def send_photo(cfg, file_path: str, caption: str = "", chat_id: int | None = None):
     token, default_chat = _tg(cfg)
@@ -41,7 +43,8 @@ async def send_photo(cfg, file_path: str, caption: str = "", chat_id: int | None
     form.add_field("chat_id", str(chat))
     if caption:
         form.add_field("caption", caption)
-    form.add_field("photo", open(file_path, "rb"), filename=file_path.split("/")[-1])
-    async with aiohttp.ClientSession() as s:
-        async with s.post(url, data=form, timeout=120) as r:
-            await r.text()
+    with open(file_path, "rb") as fh:
+        form.add_field("photo", fh, filename=Path(file_path).name)
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, data=form, timeout=120) as r:
+                await r.text()

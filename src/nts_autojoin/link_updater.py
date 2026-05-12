@@ -15,6 +15,7 @@ import yaml
 
 from .dmami_scraper import fetch_dmami, WebEvent
 from .notifier import notify, send_document
+from .settings import get_config_path, get_logs_dir, save_config
 
 
 def _norm(s: str) -> str:
@@ -44,6 +45,64 @@ def _build_title_map(events: List[WebEvent]) -> Dict[str, WebEvent]:
     return m
 
 
+DAY_ALIASES = {
+    "mon": ("mon", "monday", "пн", "понедельник"),
+    "tue": ("tue", "tuesday", "вт", "вторник"),
+    "wed": ("wed", "wednesday", "ср", "среда"),
+    "thu": ("thu", "thursday", "чт", "четверг"),
+    "fri": ("fri", "friday", "пт", "пятница"),
+    "sat": ("sat", "saturday", "сб", "суббота"),
+    "sun": ("sun", "sunday", "вс", "воскресенье"),
+}
+
+
+def _cron_day(cron_expr: str) -> str:
+    parts = (cron_expr or "").split()
+    return _norm(parts[4]) if len(parts) >= 5 else ""
+
+
+def _cron_start(cron_expr: str) -> str:
+    parts = (cron_expr or "").split()
+    if len(parts) < 2:
+        return ""
+    try:
+        return f"{int(parts[1]):02d}:{int(parts[0]):02d}"
+    except Exception:
+        return ""
+
+
+def _event_day_key(day: str) -> str:
+    value = _norm(day)
+    for key, aliases in DAY_ALIASES.items():
+        if any(alias in value for alias in aliases):
+            return key
+    return value
+
+
+def _meeting_day_key(cron_expr: str) -> str:
+    day = _cron_day(cron_expr)
+    for key, aliases in DAY_ALIASES.items():
+        if day in aliases:
+            return key
+    return day
+
+
+def _event_keys(event: WebEvent) -> List[Tuple[str, str, str]]:
+    return [(_norm(event.title), _event_day_key(event.day), event.start)]
+
+
+def _meeting_keys(meeting: Dict) -> List[Tuple[str, str, str]]:
+    cron = meeting.get("cron", "")
+    day = _meeting_day_key(cron)
+    start = _cron_start(cron)
+    names = [meeting.get("name", "")]
+    aliases = meeting.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    names.extend(aliases)
+    return [(_norm(name), day, start) for name in names if _norm(name)]
+
+
 def _match_event(title: str, title_map: Dict[str, WebEvent]) -> WebEvent | None:
     """
     Пытаемся найти событие по названию встречи из config:
@@ -71,7 +130,7 @@ def _match_event(title: str, title_map: Dict[str, WebEvent]) -> WebEvent | None:
 
 
 def _load_cfg() -> Dict:
-    p = Path("config/schedule.yaml")
+    p = get_config_path()
     if not p.exists():
         raise FileNotFoundError(p)
     return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
@@ -81,13 +140,7 @@ def _save_cfg(cfg: Dict) -> None:
     """
     Атомарное сохранение: пишем во временный файл и переименовываем.
     """
-    p = Path("config/schedule.yaml")
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(
-        yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
-    tmp.replace(p)
+    save_config(cfg)
 
 
 async def scrape_and_update(cfg: Dict, logger) -> Tuple[int, List[str]]:
@@ -111,6 +164,17 @@ async def scrape_and_update(cfg: Dict, logger) -> Tuple[int, List[str]]:
     )
 
     title_map = _build_title_map(events)
+    composite_map: Dict[Tuple[str, str, str], WebEvent] = {}
+    duplicate_keys: set[Tuple[str, str, str]] = set()
+    for event in events:
+        for key in _event_keys(event):
+            if key in composite_map:
+                duplicate_keys.add(key)
+            else:
+                composite_map[key] = event
+    for key in duplicate_keys:
+        composite_map.pop(key, None)
+
     c = _load_cfg()
     meetings = c.get("meetings", []) or []
 
@@ -120,7 +184,13 @@ async def scrape_and_update(cfg: Dict, logger) -> Tuple[int, List[str]]:
 
     for m in meetings:
         name = m.get("name", "")
-        ev = _match_event(name, title_map)
+        ev = None
+        for key in _meeting_keys(m):
+            ev = composite_map.get(key)
+            if ev:
+                break
+        if ev is None:
+            ev = _match_event(name, title_map)
         if not ev:
             continue
 
@@ -141,13 +211,14 @@ async def scrape_and_update(cfg: Dict, logger) -> Tuple[int, List[str]]:
         logger.info("[dmami] совпадений для обновления не нашли")
 
     # отчёты в файлы
-    Path("logs").mkdir(parents=True, exist_ok=True)
+    logs_dir = get_logs_dir()
+    logs_dir.mkdir(parents=True, exist_ok=True)
     from datetime import datetime
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    raw_path = Path("logs") / f"dmami_raw_{ts}.yaml"
-    map_path = Path("logs") / f"dmami_changes_{ts}.txt"
-    unmatched_path = Path("logs") / f"dmami_unmatched_{ts}.yaml"
+    raw_path = logs_dir / f"dmami_raw_{ts}.yaml"
+    map_path = logs_dir / f"dmami_changes_{ts}.txt"
+    unmatched_path = logs_dir / f"dmami_unmatched_{ts}.yaml"
 
     import yaml as _y
 

@@ -8,6 +8,11 @@ from dateutil import tz
 
 from playwright.async_api import async_playwright
 
+try:
+    from .settings import get_logs_dir
+except ImportError:
+    from nts_autojoin.settings import get_logs_dir
+
 MOSPOLY_URL = "https://e.mospolytech.ru/#/schedule/current"
 
 @dataclass
@@ -223,14 +228,15 @@ if __name__ == "__main__":
     ap.add_argument("--cookies", required=True)
     ap.add_argument("--headless", action="store_true", default=False)
     ap.add_argument("--chrome", default=None)
-    ap.add_argument("--save", default="logs/mospoly_schedule.json")
+    ap.add_argument("--save", default=None)
     args = ap.parse_args()
 
-    Path("logs").mkdir(parents=True, exist_ok=True)
+    get_logs_dir().mkdir(parents=True, exist_ok=True)
     events = asyncio.run(fetch_mospoly_schedule(args.cookies, headless=args.headless, chromium_executable=args.chrome))
     print(f"Найдено событий: {len(events)}")
     data = [asdict(e) for e in events]
-    Path(args.save).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_path = Path(args.save) if args.save else get_logs_dir() / "mospoly_schedule.json"
+    save_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"JSON сохранён: {args.save}")
 
     print("\n--- YAML фрагмент (для meetings) ---")

@@ -19,6 +19,11 @@ from typing import List, Optional, Dict, Any
 
 from playwright.async_api import async_playwright, Page
 
+try:
+    from .settings import get_logs_dir
+except ImportError:
+    from nts_autojoin.settings import get_logs_dir
+
 DMAMI = "https://rasp.dmami.ru"
 TIME_RE = re.compile(r"(\d{1,2}:\d{2})\s*[–—-]\s*(\d{1,2}:\d{2})")
 
@@ -184,7 +189,7 @@ if __name__ == "__main__":
     import argparse
     import asyncio
 
-    Path("logs").mkdir(parents=True, exist_ok=True)
+    get_logs_dir().mkdir(parents=True, exist_ok=True)
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--group", required=True, help="Номер группы, например: 231-363")
@@ -196,9 +201,7 @@ if __name__ == "__main__":
         default=None,
         help="Путь к chrome.exe / chrome (если нужен строго системный)",
     )
-    ap.add_argument(
-        "--out", default="logs/dmami_links.json", help="Куда сохранить JSON"
-    )
+    ap.add_argument("--out", default=None, help="Куда сохранить JSON")
     args = ap.parse_args()
 
     evs = asyncio.run(
@@ -206,7 +209,7 @@ if __name__ == "__main__":
     )
     print(f"Найдено ссылок: {len(evs)}")
 
-    data_path = Path(args.out)
+    data_path = Path(args.out) if args.out else get_logs_dir() / "dmami_links.json"
     data_path.parent.mkdir(parents=True, exist_ok=True)
     data_path.write_text(
         json.dumps([asdict(e) for e in evs], ensure_ascii=False, indent=2),

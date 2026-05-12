@@ -1,0 +1,9 @@
+venv/
+logs/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+config/config.local.yaml
+.env
+secrets/

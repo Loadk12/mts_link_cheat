@@ -14,6 +14,7 @@ from .join_flow import perform_join, ensure_media_disabled
 from .healthcheck import page_is_healthy
 from .live import set_page, clear_page
 from .notifier import notify, send_photo
+from .settings import get_logs_dir
 
 
 def _tz(tzname: str):
@@ -29,7 +30,7 @@ def _now(tzname: str) -> datetime:
 
 
 def _ensure_logs_dir():
-    Path("logs").mkdir(parents=True, exist_ok=True)
+    get_logs_dir().mkdir(parents=True, exist_ok=True)
 
 
 # Активные встречи: name -> (stop_event, started_at)
@@ -57,17 +58,17 @@ async def _save_artifacts(page, prefix: str, tzname: str, logger) -> str:
     """
     _ensure_logs_dir()
     ts = _now(tzname).strftime("%Y%m%d-%H%M%S")
-    base = f"logs/{prefix}_{ts}"
+    base = get_logs_dir() / f"{prefix}_{ts}"
     try:
-        await page.screenshot(path=f"{base}.png", full_page=True)
+        await page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
     except Exception as e:
         logger.warning(f"artifact screenshot failed: {e}")
     try:
         html = await page.content()
-        Path(f"{base}.html").write_text(html, encoding="utf-8", errors="ignore")
+        base.with_suffix(".html").write_text(html, encoding="utf-8", errors="ignore")
     except Exception as e:
         logger.warning(f"artifact html save failed: {e}")
-    return base
+    return str(base)
 
 
 async def _send_success_screenshot(page, prefix: str, tzname: str, cfg: dict, name: str, logger):

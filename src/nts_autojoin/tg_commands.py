@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from .notifier import notify, send_document, send_photo
 from .healthcheck import page_is_healthy
 from .live import get_any_page
-from .settings import load_config
+from .settings import get_logs_dir, load_config
 BASE_DIR = Path(__file__).resolve().parents[2]
 OFFSET_FILE = BASE_DIR / "logs" / "tg_offset.state"
 STALE_SEC = 300  # игнор опасных команд старше 5 минут
@@ -179,11 +179,9 @@ def _today_summary(cfg: dict) -> str:
 def _pick_current_meeting(
     cfg: dict,
 ) -> Optional[Tuple[dict, datetime, datetime]]:
-    """Вернуть (meeting, start, end), если сейчас идёт; иначе ближайшую будущую."""
+    """Return (meeting, start, end) only when the meeting is active now."""
     tzinfo = _tz(cfg)
     now = datetime.now(tzinfo)
-    cand = None
-    cand_start = cand_end = None
     for m in cfg.get("meetings", []) or []:
         if not _meeting_active_on(m, now.date()):
             continue
@@ -194,16 +192,31 @@ def _pick_current_meeting(
         trig = CronTrigger.from_crontab(cron, timezone=tzinfo)
         prev = trig.get_prev_fire_time(None, now)
         if prev:
-            start = prev
-            end = start + timedelta(minutes=dur)
-            if start <= now <= end:
-                return m, start, end
-        nxt = trig.get_next_fire_time(None, now)
-        if nxt and cand is None:
-            cand, cand_start, cand_end = m, nxt, nxt + timedelta(minutes=dur)
-    if cand:
-        return cand, cand_start, cand_end
+            start_dt = prev
+            end_dt = start_dt + timedelta(minutes=dur)
+            if start_dt <= now <= end_dt:
+                return m, start_dt, end_dt
     return None
+
+
+def _pick_next_meeting(cfg: dict) -> Optional[Tuple[dict, datetime, datetime]]:
+    """Return the closest future meeting, respecting start/end dates."""
+    tzinfo = _tz(cfg)
+    now = datetime.now(tzinfo)
+    candidates: List[Tuple[datetime, dict, datetime]] = []
+    for m in cfg.get("meetings", []) or []:
+        cron = m.get("cron")
+        if not cron:
+            continue
+        dur = int(m.get("duration_minutes", 45))
+        trig = CronTrigger.from_crontab(cron, timezone=tzinfo)
+        nxt = trig.get_next_fire_time(None, now)
+        if nxt and _meeting_active_on(m, nxt.date()):
+            candidates.append((nxt, m, nxt + timedelta(minutes=dur)))
+    if not candidates:
+        return None
+    start_dt, meeting, end_dt = min(candidates, key=lambda item: item[0])
+    return meeting, start_dt, end_dt
 
 
 HELP = (
@@ -280,6 +293,7 @@ async def run_bot(
             offset = max_valid_offset
 
     _write_offset(offset)
+    pull_lock = asyncio.Lock()
 
     async def _cmd_links() -> str:
         c = _load_cfg()
@@ -338,10 +352,22 @@ async def run_bot(
 
         if cmd == "/pull":
             if is_stale:
-                await send_reply("⏭️ Игнорирую старую команду /pull.")
+                await send_reply("Ignoring stale /pull command.")
                 return
-            msg = await dmami_pull_cb()
-            await send_reply(msg)
+            if pull_lock.locked():
+                await send_reply("DMAMI pull already running.")
+                return
+
+            async def run_pull_in_background():
+                async with pull_lock:
+                    try:
+                        msg = await dmami_pull_cb()
+                    except Exception as e:
+                        msg = f"DMAMI pull failed: {e}"
+                    await _send(cfg, msg, chat_id)
+
+            asyncio.create_task(run_pull_in_background())
+            await send_reply("DMAMI pull started. I will send the result when it finishes.")
             return
 
         if cmd == "/reload":
@@ -371,11 +397,11 @@ async def run_bot(
 
                 tzinfo = _tz(cfg)
                 tsname = datetime.now(tzinfo).strftime("%Y%m%d-%H%M%S")
-                Path("logs").mkdir(parents=True, exist_ok=True)
-                out = f"logs/deskshot_{tsname}.png"
+                out = get_logs_dir() / f"deskshot_{tsname}.png"
+                out.parent.mkdir(parents=True, exist_ok=True)
                 with mss() as sct:
-                    sct.shot(output=out)
-                await send_photo_reply(out, caption="🖥️ Скрин рабочего стола (fallback)")
+                    sct.shot(output=str(out))
+                await send_photo_reply(str(out), caption="🖥️ Скрин рабочего стола (fallback)")
             except Exception as e:
                 await send_reply(f"📷 Не смог снять десктоп: {e}")
             return

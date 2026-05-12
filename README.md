@@ -1,32 +1,61 @@
-# NTS Auto-Join (Windows) — МТС Линк
+# NTS Auto-Join (Windows) - МТС Линк
 
-Собран под твою ссылку и имя.
+Windows/NSSM-сервис для автоподключения к занятиям МТС Линк по расписанию из `config/schedule.yaml`.
 
-- Сервисный режим через NSSM (или разовый запуск).
-- Не даёт Windows уснуть.
-- Автовход в лобби МТС Линк (фокус → ввод имени → клик «Присоединиться»).
-- Healthcheck: DOM (кнопки/aria-label), WebSocket, WebRTC. Авторелоад при обрыве.
-- Уведомления в Telegram (заполни токен/чат при желании).
-
-## Запуск (быстрый тест)
+## Быстрый запуск
 
 ```powershell
 cd <папка_проекта>
-py -3.10 -m venv venv
-.env\Scripts\Activate.ps1
-pip install -r requirements.txt
+py -3.12 -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install -e .
 python -m playwright install chromium
 python -m nts_autojoin.service_main
 ```
 
-Логи смотри в `./logs/ntsbot.log`.
+Логи пишутся в `logs/ntsbot.log`.
 
-## Установка как сервис (опционально)
+## Локальные секреты
+
+Не храните токены и cookies в отслеживаемых файлах. Для локальных значений используйте `config/config.local.yaml`:
+
+```yaml
+notify:
+  telegram_bot_token: "<token>"
+  telegram_chat_id: "<chat_id>"
+  allowed_user_ids:
+  - 123456789
+```
+
+Cookies для ручного скрейпа Мосполитеха кладутся в `secrets/mospoly_cookies.json`. Папка `secrets/` исключена из Git.
+
+## NSSM
+
+Установка сервиса от имени администратора:
+
 ```powershell
-# от имени администратора; положи nssm.exe в .\scripts\ или добавь в PATH
 .\scripts\install_service.ps1
 ```
 
+Проверка параметров:
+
+```powershell
+nssm get NTS-AutoJoin Application
+nssm get NTS-AutoJoin AppDirectory
+nssm get NTS-AutoJoin AppParameters
+nssm get NTS-AutoJoin AppStdout
+nssm get NTS-AutoJoin AppStderr
+```
+
+Ожидаемо:
+
+- `Application`: `<repo>\venv\Scripts\python.exe`
+- `AppDirectory`: `<repo>`
+- `AppParameters`: `-m nts_autojoin.service_main`
+
 ## Где править
-- `config/schedule.yaml` — расписание/уведомления/селекторы.
-- Таймзона стоит `Europe/Moscow` — поменяй при необходимости.
+
+- `config/schedule.yaml` - расписание, селекторы входа, healthcheck, Chromium.
+- `config/config.local.yaml` - локальные Telegram-секреты.
+- `assets/black.y4m` и `assets/silence.wav` - fake media для Chrome.
