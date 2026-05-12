@@ -1,9 +1,12 @@
 timezone: Europe/Moscow
 dmami:
   group: 231-363
+  enabled: true
+  auto_generate_schedule: true
+  auto_generate_on_start: false
+  lookahead_weeks: 8
+  scan_weeks: 8
 notify:
-  telegram_bot_token: null
-  telegram_chat_id: null
   on_start_summary: true
   daily_summary: true
   daily_summary_hour: 7
@@ -44,6 +47,39 @@ healthcheck:
       сообщение"], [placeholder="Введите сообщение"]
   - type: websocket_open
   - type: webrtc_active
+default_join:
+  steps:
+  - action: wait
+    selector: '#EventEnterForm'
+    timeout_ms: 20000
+  - action: click
+    selector: '#name'
+  - action: fill
+    selector: '#name'
+    value: Р›СѓС…РЅРµРІ РћР»РµРі 231-363
+  - action: press
+    selector: '#name'
+    value: Tab
+  - action: wait
+    selector: button[data-testid='EventLanding.enter-to-event']:not([disabled])
+    timeout_ms: 8000
+  - action: click
+    selector: button[data-testid='EventLanding.enter-to-event']
+  - action: maybe_click
+    selector: button[aria-label*="Р’С‹РєР»СЋС‡РёС‚СЊ РјРёРєСЂРѕС„РѕРЅ" i]
+  - action: maybe_click
+    selector: button[aria-label*="Р’С‹РєР»СЋС‡РёС‚СЊ РєР°РјРµСЂСѓ" i]
+  - action: wait
+    selector: button:has-text("РџСЂРёСЃРѕРµРґРёРЅРёС‚СЊСЃСЏ Рє РІСЃС‚СЂРµС‡Рµ")
+    timeout_ms: 15000
+  - action: click
+    selector: button:has-text("РџСЂРёСЃРѕРµРґРёРЅРёС‚СЊСЃСЏ Рє РІСЃС‚СЂРµС‡Рµ")
+  - action: sleep
+    value: 1200
+  - action: maybe_click
+    selector: button[aria-label*="Р’С‹РєР»СЋС‡РёС‚СЊ РјРёРєСЂРѕС„РѕРЅ" i]
+  - action: maybe_click
+    selector: button[aria-label*="Р’С‹РєР»СЋС‡РёС‚СЊ РєР°РјРµСЂСѓ" i]
 meetings:
 - name: Проектирование интернет-приложений (Лекция)
   url: https://my.mts-link.ru/j/19400763/7931368744/session/7625531348

@@ -19,6 +19,14 @@ def get_local_config_path() -> Path:
     return get_project_root() / "config" / "config.local.yaml"
 
 
+def get_generated_config_path() -> Path:
+    return get_project_root() / "config" / "schedule.generated.yaml"
+
+
+def get_overrides_config_path() -> Path:
+    return get_project_root() / "config" / "schedule.overrides.yaml"
+
+
 def get_logs_dir() -> Path:
     return get_project_root() / "logs"
 
@@ -49,6 +57,132 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
         else:
             out[key] = value
     return out
+
+
+def _merge_config_layers(
+    base: Dict[str, Any],
+    generated: Dict[str, Any],
+    overrides: Dict[str, Any],
+    local: Dict[str, Any],
+) -> Dict[str, Any]:
+    cfg = dict(base)
+    dmami = cfg.get("dmami") or {}
+    generated_enabled = bool(dmami.get("auto_generate_schedule"))
+
+    generated_meetings = generated.get("meetings") if generated else None
+    if generated_enabled and isinstance(generated_meetings, list):
+        cfg["meetings"] = generated_meetings
+        cfg["generated_schedule"] = {
+            "path": str(get_generated_config_path()),
+            "exists": True,
+            "enabled": True,
+            "generated_at": generated.get("generated_at"),
+            "source": generated.get("source") or {},
+        }
+    elif generated_enabled:
+        cfg["meetings"] = []
+        cfg["generated_schedule"] = {
+            "path": str(get_generated_config_path()),
+            "exists": False,
+            "enabled": True,
+            "generated_at": None,
+            "source": {},
+        }
+    else:
+        cfg["generated_schedule"] = {
+            "path": str(get_generated_config_path()),
+            "exists": bool(generated),
+            "enabled": generated_enabled,
+            "generated_at": generated.get("generated_at") if generated else None,
+            "source": generated.get("source") if generated else {},
+        }
+
+    if overrides:
+        cfg = _apply_meeting_overrides(cfg, overrides)
+
+    cfg = _deep_merge(cfg, local)
+    return _apply_default_join(cfg)
+
+
+def _meeting_override_keys(meeting: Dict[str, Any]) -> set[str]:
+    keys = set()
+    for key in ("dmami_key", "name"):
+        value = meeting.get(key)
+        if value:
+            keys.add(str(value).strip().lower())
+    aliases = meeting.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    for alias in aliases:
+        if alias:
+            keys.add(str(alias).strip().lower())
+    return keys
+
+
+def _apply_meeting_overrides(
+    cfg: Dict[str, Any], overrides: Dict[str, Any]
+) -> Dict[str, Any]:
+    override_items = overrides.get("meetings") or []
+    if not isinstance(override_items, list):
+        return cfg
+
+    override_map: Dict[str, Dict[str, Any]] = {}
+    for item in override_items:
+        if not isinstance(item, dict):
+            continue
+        for key in _meeting_override_keys(item):
+            override_map[key] = item
+
+    if not override_map:
+        return cfg
+
+    meetings = []
+    for meeting in cfg.get("meetings", []) or []:
+        if not isinstance(meeting, dict):
+            meetings.append(meeting)
+            continue
+        override = None
+        for key in _meeting_override_keys(meeting):
+            override = override_map.get(key)
+            if override:
+                break
+        if not override:
+            meetings.append(meeting)
+            continue
+        merged = _deep_merge(meeting, {k: v for k, v in override.items() if k != "aliases"})
+        if merged.get("disabled"):
+            continue
+        meetings.append(merged)
+
+    cfg = dict(cfg)
+    cfg["meetings"] = meetings
+    return cfg
+
+
+def _apply_default_join(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    default_join = cfg.get("default_join")
+    if not default_join:
+        return cfg
+
+    changed = False
+    meetings = []
+    for meeting in cfg.get("meetings", []) or []:
+        if not isinstance(meeting, dict):
+            meetings.append(meeting)
+            continue
+        if meeting.get("join"):
+            meetings.append(meeting)
+            continue
+        updated = dict(meeting)
+        updated["join"] = default_join
+        meetings.append(updated)
+        changed = True
+
+    if not changed:
+        return cfg
+    cfg = dict(cfg)
+    cfg["meetings"] = meetings
+    return cfg
 
 
 def _apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -95,8 +229,12 @@ def _normalize_chromium_paths(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def load_config() -> Dict[str, Any]:
-    cfg = _read_yaml(get_config_path())
-    cfg = _deep_merge(cfg, _read_yaml(get_local_config_path()))
+    cfg = _merge_config_layers(
+        _read_yaml(get_config_path()),
+        _read_yaml(get_generated_config_path()),
+        _read_yaml(get_overrides_config_path()),
+        _read_yaml(get_local_config_path()),
+    )
     cfg = _apply_env_overrides(cfg)
     return _normalize_chromium_paths(cfg)
 

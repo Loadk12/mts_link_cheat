@@ -5,5 +5,9 @@ __pycache__/
 *.egg-info/
 
 config/config.local.yaml
+config/schedule.generated.yaml
+config/generated_meetings.yaml
+config/schedule.overrides.yaml
 .env
 secrets/
+scripts/nssm.exe

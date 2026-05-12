@@ -89,19 +89,105 @@ def _tg(cfg):
     )
 
 
-async def _send(cfg, text: str, chat_id: Optional[int] = None):
+async def _send(cfg, text: str, chat_id: Optional[int] = None, reply_markup: Optional[dict] = None):
     token, default_chat, *_ = _tg(cfg)
     chat = chat_id or default_chat
     if not token or not chat:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = {"chat_id": chat, "text": text, "disable_web_page_preview": True}
+    if reply_markup:
+        data["reply_markup"] = reply_markup
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(url, json=data, timeout=60) as r:
                 await r.text()
     except Exception:
         pass
+
+
+async def _edit_or_send(
+    cfg,
+    chat_id: int,
+    message_id: Optional[int],
+    text: str,
+    reply_markup: Optional[dict] = None,
+):
+    token, *_ = _tg(cfg)
+    if not token or not chat_id or not message_id:
+        await _send(cfg, text, chat_id, reply_markup)
+        return
+    url = f"https://api.telegram.org/bot{token}/editMessageText"
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json=data, timeout=60) as r:
+                resp = await r.json()
+        if not resp.get("ok"):
+            await _send(cfg, text, chat_id, reply_markup)
+    except Exception:
+        await _send(cfg, text, chat_id, reply_markup)
+
+
+async def _answer_callback(cfg, callback_id: str, text: str = ""):
+    token, *_ = _tg(cfg)
+    if not token or not callback_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+    data = {"callback_query_id": callback_id}
+    if text:
+        data["text"] = text
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json=data, timeout=30) as r:
+                await r.text()
+    except Exception:
+        pass
+
+
+def _kb(rows: list[list[tuple[str, str]]]) -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": text, "callback_data": data} for text, data in row]
+            for row in rows
+        ]
+    }
+
+
+def _main_keyboard() -> dict:
+    return _kb(
+        [
+            [("🔌 Подключиться сейчас", "act:connect")],
+            [("📅 Сегодня", "menu:today"), ("🔄 Обновить DMAMI", "act:pull")],
+            [("📷 Скрин", "act:shot"), ("❤️ Healthcheck", "act:health")],
+            [("🧾 Логи", "menu:logs")],
+        ]
+    )
+
+
+def _back_keyboard() -> dict:
+    return _kb([[("🔙 Назад", "menu:home"), ("🔄 Обновить", "menu:today")]])
+
+
+def _pull_confirm_keyboard() -> dict:
+    return _kb([[("Да, обновить", "confirm:pull"), ("Отмена", "cancel")]])
+
+
+def _logs_keyboard() -> dict:
+    return _kb(
+        [
+            [("service_stderr.log", "log:service_stderr"), ("service_stdout.log", "log:service_stdout")],
+            [("dmami_changes", "log:dmami_changes"), ("dmami_generated", "log:dmami_generated")],
+            [("🔙 Назад", "menu:home")],
+        ]
+    )
 
 
 def _read_offset() -> int:
@@ -219,6 +305,110 @@ def _pick_next_meeting(cfg: dict) -> Optional[Tuple[dict, datetime, datetime]]:
     return meeting, start_dt, end_dt
 
 
+def _render_home(cfg: dict) -> str:
+    dmami = cfg.get("dmami") or {}
+    generated = cfg.get("generated_schedule") or {}
+    current = _pick_current_meeting(cfg)
+    next_item = _pick_next_meeting(cfg)
+
+    lines = [
+        "NTS AutoJoin",
+        "",
+        "Статус:",
+        "• сервис работает",
+        f"• группа DMAMI: {dmami.get('group') or '-'}",
+        f"• timezone: {cfg.get('timezone', 'Europe/Moscow')}",
+        "• расписание: "
+        + ("сгенерировано" if generated.get("exists") else "не сгенерировано"),
+    ]
+    if current:
+        meeting, start, end = current
+        lines.append(
+            f"• текущая пара: {start.strftime('%H:%M')}-{end.strftime('%H:%M')} {meeting.get('name', '-')}"
+        )
+    else:
+        lines.append("• текущая пара: нет")
+    if next_item:
+        meeting, start, _end = next_item
+        lines.append(
+            f"• следующая пара: {start.strftime('%d.%m %H:%M')} {meeting.get('name', '-')}"
+        )
+    else:
+        lines.append("• следующая пара: нет")
+    return "\n".join(lines)
+
+
+def _render_today(cfg: dict) -> str:
+    tzinfo = _tz(cfg)
+    now = datetime.now(tzinfo)
+    items = []
+    for meeting in cfg.get("meetings", []) or []:
+        if not _meeting_active_on(meeting, now.date()):
+            continue
+        cron = meeting.get("cron")
+        if not cron:
+            continue
+        for start in _occurrences_today(cron, tzinfo):
+            duration = int(meeting.get("duration_minutes", 45))
+            end = start + timedelta(minutes=duration)
+            if end < now:
+                status = "прошла"
+            elif start <= now <= end:
+                status = "идёт сейчас"
+            else:
+                status = "будет позже"
+            items.append((start, end, meeting, status))
+
+    lines = [f"Сегодня, {now.strftime('%d.%m.%Y')}"]
+    if not items:
+        lines.append("Пар на сегодня нет.")
+        return "\n".join(lines)
+
+    for start, end, meeting, status in sorted(items, key=lambda item: item[0]):
+        lines.append(
+            f"• {start.strftime('%H:%M')}-{end.strftime('%H:%M')} "
+            f"{meeting.get('name', 'Без названия')} — {status}"
+        )
+    return "\n".join(lines)
+
+
+def _latest_log(pattern: str) -> Optional[Path]:
+    logs_dir = get_logs_dir()
+    matches = sorted(
+        logs_dir.glob(pattern),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0,
+        reverse=True,
+    )
+    return matches[0] if matches else None
+
+
+def _tail_text(path: Path, max_chars: int = 3500) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"Не удалось прочитать {path.name}: {e}"
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+        return f"{path.name} (последние символы):\n{text}"
+    return f"{path.name}:\n{text or '<пусто>'}"
+
+
+def _render_log(kind: str) -> str:
+    patterns = {
+        "service_stderr": "service_stderr.log",
+        "service_stdout": "service_stdout.log",
+        "dmami_changes": "dmami_changes_*.txt",
+        "dmami_generated": "dmami_generated_*.yaml",
+    }
+    pattern = patterns.get(kind)
+    if not pattern:
+        return "Неизвестный лог."
+    path = _latest_log(pattern)
+    if not path:
+        return f"Лог {pattern} пока не найден."
+    return _tail_text(path)
+
+
 HELP = (
     "Доступные команды:\n"
     "/status — план на сегодня\n"
@@ -302,6 +492,130 @@ async def run_bot(
             lines.append(f"• {m.get('name','Без имени')}: {m.get('url','<нет url>')}")
         return "\n".join(lines)
 
+    async def _send_menu(chat_id: int, message_id: Optional[int] = None):
+        await _edit_or_send(cfg, chat_id, message_id, _render_home(_load_cfg()), _main_keyboard())
+
+    async def _send_today(chat_id: int, message_id: Optional[int] = None):
+        keyboard = _kb([[("🔌 Подключиться к текущей", "act:connect")], [("🔙 Назад", "menu:home"), ("🔄 Обновить", "menu:today")]])
+        await _edit_or_send(cfg, chat_id, message_id, _render_today(_load_cfg()), keyboard)
+
+    async def _send_logs(chat_id: int, message_id: Optional[int] = None):
+        await _edit_or_send(cfg, chat_id, message_id, "Логи", _logs_keyboard())
+
+    async def _run_pull_background(chat_id: int):
+        async with pull_lock:
+            try:
+                msg = await dmami_pull_cb()
+            except Exception as e:
+                msg = f"DMAMI sync failed: {e}"
+            await _send(cfg, msg, chat_id)
+
+    async def _send_or_capture_shot(chat_id: int):
+        path = await screenshot_cb()
+        if path:
+            await send_photo(cfg, path, caption="📷 Текущая вкладка (Playwright)", chat_id=chat_id)
+            return
+        try:
+            from mss import mss
+
+            tzinfo = _tz(cfg)
+            tsname = datetime.now(tzinfo).strftime("%Y%m%d-%H%M%S")
+            out = get_logs_dir() / f"deskshot_{tsname}.png"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with mss() as sct:
+                sct.shot(output=str(out))
+            await send_photo(cfg, str(out), caption="🖥️ Скрин рабочего стола", chat_id=chat_id)
+        except Exception as e:
+            await _send(cfg, f"Не смог сделать скрин: {e}", chat_id)
+
+    async def _connect_current(chat_id: int) -> None:
+        current = _pick_current_meeting(_load_cfg())
+        if not current:
+            await _send(cfg, "Сейчас нет активной пары.", chat_id)
+            return
+        meeting, _start, _end = current
+        now = datetime.now(_tz(cfg))
+        msg = await connect_cb(
+            meeting["url"],
+            now.hour,
+            now.minute,
+            int(meeting.get("duration_minutes", 90)),
+        )
+        await _send(cfg, msg, chat_id)
+
+    async def _send_health(chat_id: int) -> None:
+        try:
+            page = get_any_page()
+            if not page:
+                await _send(cfg, "Нет активных вкладок.", chat_id)
+                return
+            ok = await page_is_healthy(page, cfg.get("healthcheck", {}) or {})
+            await _send(cfg, f"Текущий статус: {'OK' if ok else 'FAIL'}", chat_id)
+        except Exception as e:
+            await _send(cfg, f"Не удалось проверить healthcheck: {e}", chat_id)
+
+    async def handle_callback(upd: dict):
+        nonlocal cfg
+        query = upd.get("callback_query") or {}
+        callback_id = query.get("id")
+        data = query.get("data") or ""
+        msg = query.get("message") or {}
+        chat_id = int((msg.get("chat") or {}).get("id") or 0)
+        message_id = msg.get("message_id")
+        ts = int(msg.get("date", 0))
+        user_id = int((query.get("from") or {}).get("id") or chat_id or 0)
+        is_allowed = not allowed_ids or user_id in allowed_ids or chat_id in allowed_ids
+        if not is_allowed:
+            await _answer_callback(cfg, callback_id, "Нет доступа.")
+            return
+
+        await _answer_callback(cfg, callback_id)
+        now_epoch = int(datetime.utcnow().timestamp())
+        is_stale = ts and (now_epoch - ts) > STALE_SEC
+
+        if data == "menu:home" or data == "cancel":
+            await _send_menu(chat_id, message_id)
+            return
+        if data == "menu:today":
+            await _send_today(chat_id, message_id)
+            return
+        if data == "menu:logs":
+            await _send_logs(chat_id, message_id)
+            return
+        if data == "act:connect":
+            await _connect_current(chat_id)
+            return
+        if data == "act:shot":
+            await _send_or_capture_shot(chat_id)
+            return
+        if data == "act:health":
+            await _send_health(chat_id)
+            return
+        if data == "act:pull":
+            await _edit_or_send(
+                cfg,
+                chat_id,
+                message_id,
+                "Обновить расписание из DMAMI?",
+                _pull_confirm_keyboard(),
+            )
+            return
+        if data == "confirm:pull":
+            if is_stale:
+                await _send(cfg, "Игнорирую старую кнопку обновления DMAMI.", chat_id)
+                return
+            if pull_lock.locked():
+                await _send(cfg, "DMAMI sync уже выполняется.", chat_id)
+                return
+            asyncio.create_task(_run_pull_background(chat_id))
+            await _edit_or_send(cfg, chat_id, message_id, "Запустил обновление расписания.", _main_keyboard())
+            return
+        if data.startswith("log:"):
+            kind = data.split(":", 1)[1]
+            await _edit_or_send(cfg, chat_id, message_id, _render_log(kind), _logs_keyboard())
+            return
+        await _send_menu(chat_id, message_id)
+
     async def handle(chat_id: int, text: str, ts: int, upd_id: int):
         nonlocal cfg
 
@@ -321,12 +635,16 @@ async def run_bot(
 
         is_allowed = not allowed_ids or chat_id in allowed_ids
 
-        if cmd in ("/help", "/start"):
+        if cmd == "/help":
             await send_help()
             return
 
         if not is_allowed:
             await send_help()
+            return
+
+        if cmd in ("/start", "/menu"):
+            await _send_menu(chat_id)
             return
 
         if cmd == "/status":
@@ -358,15 +676,7 @@ async def run_bot(
                 await send_reply("DMAMI pull already running.")
                 return
 
-            async def run_pull_in_background():
-                async with pull_lock:
-                    try:
-                        msg = await dmami_pull_cb()
-                    except Exception as e:
-                        msg = f"DMAMI pull failed: {e}"
-                    await _send(cfg, msg, chat_id)
-
-            asyncio.create_task(run_pull_in_background())
+            asyncio.create_task(_run_pull_background(chat_id))
             await send_reply("DMAMI pull started. I will send the result when it finishes.")
             return
 
@@ -488,6 +798,9 @@ async def run_bot(
             for upd in data.get("result", []):
                 upd_id = upd["update_id"]
                 max_id = upd_id if (max_id is None or upd_id > max_id) else max_id
+                if upd.get("callback_query"):
+                    await handle_callback(upd)
+                    continue
                 msg = upd.get("message") or upd.get("edited_message")
                 if not msg:
                     continue

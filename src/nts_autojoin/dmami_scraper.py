@@ -35,6 +35,11 @@ class WebEvent:
     end: str
     title: str
     href: str
+    lesson_type: str = ""
+    date: str = ""
+    teacher: str = ""
+    room: str = ""
+    raw_text: str = ""
 
 
 # ---------- helpers ----------
@@ -141,10 +146,17 @@ async def fetch_dmami(
                       const time  = timeEl?.textContent?.trim() || '';
                       const titleEl = pair?.querySelector('.bold.small') || pair?.querySelector('.discipline-name');
                       const title = titleEl?.textContent?.trim() || '';
+                      const typeEl = pair?.querySelector('.lesson-type, .type, .kind');
+                      const lesson_type = typeEl?.textContent?.trim() || '';
+                      const teacherEl = pair?.querySelector('.teacher, .lecturer');
+                      const teacher = teacherEl?.textContent?.trim() || '';
+                      const roomEl = pair?.querySelector('.room, .auditory, .auditorium');
+                      const room = roomEl?.textContent?.trim() || '';
                       const dayRoot = a.closest('.schedule-day') || pair?.closest('.schedule-day');
                       const dayEl = dayRoot?.querySelector('.schedule-day__title');
                       const day   = dayEl?.textContent?.trim() || '';
-                      return { day, time, title, href: a.href };
+                      const raw_text = pair?.textContent?.replace(/\\s+/g, ' ').trim() || '';
+                      return { day, time, title, href: a.href, lesson_type, teacher, room, raw_text };
                     });
                 }"""
             )
@@ -156,7 +168,17 @@ async def fetch_dmami(
                 day = (it.get("day") or "").strip()
                 if href and title and start and end:
                     events.append(
-                        WebEvent(day=day, start=start, end=end, title=title, href=href)
+                        WebEvent(
+                            day=day,
+                            start=start,
+                            end=end,
+                            title=title,
+                            href=href,
+                            lesson_type=(it.get("lesson_type") or "").strip(),
+                            teacher=(it.get("teacher") or "").strip(),
+                            room=(it.get("room") or "").strip(),
+                            raw_text=(it.get("raw_text") or "").strip(),
+                        )
                     )
         finally:
             await context.close()

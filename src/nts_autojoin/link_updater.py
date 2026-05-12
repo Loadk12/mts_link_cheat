@@ -13,7 +13,8 @@ import re
 
 import yaml
 
-from .dmami_scraper import fetch_dmami, WebEvent
+from .dmami_scraper import WebEvent
+from .dmami_schedule import format_sync_report, sync_dmami_schedule
 from .notifier import notify, send_document
 from .settings import get_config_path, get_logs_dir, save_config
 
@@ -152,125 +153,8 @@ async def scrape_and_update(cfg: Dict, logger) -> Tuple[int, List[str]]:
 
     Возвращает: (сколько url обновили, список строк лога для человекочитаемого отчёта).
     """
-    group = ((cfg.get("dmami") or {}).get("group") or "").strip()
-    if not group:
-        raise RuntimeError("В конфиге нет dmami.group")
+    result = await sync_dmami_schedule(cfg, logger)
+    report = format_sync_report(result)
+    logger.info("[dmami] generated meetings: %s", result["generated_meetings"])
 
-    logger.info(f"[dmami] скрейп для группы {group}…")
-    events = await fetch_dmami(
-        group,
-        headless=True,
-        chrome=(cfg.get("chromium") or {}).get("executable_path"),
-    )
-
-    title_map = _build_title_map(events)
-    composite_map: Dict[Tuple[str, str, str], WebEvent] = {}
-    duplicate_keys: set[Tuple[str, str, str]] = set()
-    for event in events:
-        for key in _event_keys(event):
-            if key in composite_map:
-                duplicate_keys.add(key)
-            else:
-                composite_map[key] = event
-    for key in duplicate_keys:
-        composite_map.pop(key, None)
-
-    c = _load_cfg()
-    meetings = c.get("meetings", []) or []
-
-    changes: List[str] = []
-    updated = 0
-    matched_ids: set[int] = set()
-
-    for m in meetings:
-        name = m.get("name", "")
-        ev = None
-        for key in _meeting_keys(m):
-            ev = composite_map.get(key)
-            if ev:
-                break
-        if ev is None:
-            ev = _match_event(name, title_map)
-        if not ev:
-            continue
-
-        old = (m.get("url") or "").strip()
-        new = (ev.href or "").strip()
-        if old != new and new:
-            m["url"] = new
-            updated += 1
-            changes.append(f"• {name}\n    {old or '—'}\n →  {new}")
-        matched_ids.add(id(ev))
-
-    unmatched: List[WebEvent] = [e for e in events if id(e) not in matched_ids]
-
-    if updated > 0:
-        _save_cfg(c)
-        logger.info(f"[dmami] обновлено ссылок: {updated}")
-    else:
-        logger.info("[dmami] совпадений для обновления не нашли")
-
-    # отчёты в файлы
-    logs_dir = get_logs_dir()
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    from datetime import datetime
-
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    raw_path = logs_dir / f"dmami_raw_{ts}.yaml"
-    map_path = logs_dir / f"dmami_changes_{ts}.txt"
-    unmatched_path = logs_dir / f"dmami_unmatched_{ts}.yaml"
-
-    import yaml as _y
-
-    raw_path.write_text(
-        _y.safe_dump(
-            [e.__dict__ for e in events],
-            allow_unicode=True,
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-    map_body_lines: List[str] = list(changes)
-
-    if unmatched:
-        map_body_lines.append("")
-        map_body_lines.append(
-            "Новые/нематченные пары (нет соответствующей встречи в config/schedule.yaml):"
-        )
-        for e in unmatched:
-            map_body_lines.append(
-                f"! {e.title} — {e.day} {e.start}-{e.end}\n    {e.href}"
-            )
-        unmatched_path.write_text(
-            _y.safe_dump(
-                [e.__dict__ for e in unmatched],
-                allow_unicode=True,
-                sort_keys=False,
-            ),
-            encoding="utf-8",
-        )
-
-    map_path.write_text(
-        "\n".join(map_body_lines) if map_body_lines else "Нет изменений.",
-        encoding="utf-8",
-    )
-
-    # уведомления
-    try:
-        msg = (
-            f"📥 DMAMI: найдено {len(events)} ссылок. "
-            f"Обновлено в расписании: {updated}. "
-            f"Новых/нематченных: {len(unmatched)}."
-        )
-        await notify(cfg, msg)
-        await send_document(cfg, str(raw_path), caption="dmami_raw.yaml")
-        await send_document(cfg, str(map_path), caption="dmami_changes.txt")
-        if unmatched:
-            await send_document(
-                cfg, str(unmatched_path), caption="dmami_unmatched.yaml"
-            )
-    except Exception:
-        # уведомления не критичны
-        pass
-
-    return updated, changes
+    return int(result["updated_urls"]), [report]

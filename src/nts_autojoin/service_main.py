@@ -60,10 +60,7 @@ async def main():
     tzname = cfg.get("timezone", "Europe/Moscow")
     tzinfo = tz.gettz(tzname)
 
-    scheduler = AsyncIOScheduler(timezone=tzinfo)
-    schedule_jobs(scheduler, cfg, logger)
-
-    async def _dmami_pull_job():
+    async def _dmami_pull_job(notify_result: bool = False):
         nonlocal cfg
         try:
             updated, _changes = await scrape_and_update(cfg, logger)
@@ -72,18 +69,38 @@ async def main():
             scheduler.remove_all_jobs()
             schedule_jobs(scheduler, new_cfg, logger)
             cfg = new_cfg
-            await notify(
-                cfg,
-                f"🧩 Автопул DMAMI завершён. Обновлено ссылок: {updated}.",
-            )
+            report = _changes[0] if _changes else f"DMAMI sync завершён. Updated URLs: {updated}."
+            if notify_result:
+                await notify(cfg, report)
+            return report
         except Exception as e:
             logger.error(f"DMAMI автопул ошибка: {e}")
             try:
                 await notify(cfg, f"⛔ DMAMI автопул ошибка: {e}")
             except Exception:
                 pass
+            raise
+
+    scheduler = AsyncIOScheduler(timezone=tzinfo)
+    schedule_jobs(scheduler, cfg, logger)
 
     scheduler.start()
+
+    dmami_cfg = cfg.get("dmami") or {}
+    generated_state = cfg.get("generated_schedule") or {}
+    if dmami_cfg.get("auto_generate_schedule") and not generated_state.get("exists"):
+        msg = (
+            "DMAMI auto schedule включён, но generated schedule ещё не создан. "
+            "Запустите /pull или кнопку «Обновить DMAMI»."
+        )
+        logger.warning(msg)
+        try:
+            await notify(cfg, msg)
+        except Exception:
+            pass
+        if dmami_cfg.get("auto_generate_on_start", False):
+            logger.info("dmami.auto_generate_on_start=true, starting DMAMI sync.")
+            asyncio.create_task(_dmami_pull_job(notify_result=True))
 
     # стартовый дайджест
     ncfg = cfg.get("notify") or {}
@@ -174,8 +191,7 @@ async def main():
         """
         /pull — скрейп DMAMI, обновить ссылки, перепланировать.
         """
-        await _dmami_pull_job()
-        return "📥 DMAMI: пул выполнен, расписание перепланировано."
+        return await _dmami_pull_job()
 
     async def connect_now_cb(url: str, hh: int, mm: int, dur_min: int) -> str:
         """
