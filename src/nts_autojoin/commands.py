@@ -7,7 +7,7 @@ from .screens import take_screenshot
 from .scheduler import run_meeting
 from dateutil import tz
 from datetime import datetime, timedelta
-from apscheduler.triggers.cron import CronTrigger
+from .cron_helpers import prev_fire_time
 
 def parse_connect_args(text: str):
     parts = text.strip().split()
@@ -22,12 +22,11 @@ def pick_current_meeting(cfg: Dict, now, logger):
     for m in (cfg.get("meetings") or []):
         cron_expr = m.get("cron"); dur = int(m.get("duration_minutes", 60))
         if not cron_expr: continue
-        trig = CronTrigger.from_crontab(cron_expr, timezone=tz.gettz(tzname))
-        prev_fire = trig.get_prev_fire_time(None, now)
+        prev_fire = prev_fire_time(cron_expr, tz.gettz(tzname), now)
         if prev_fire:
             start = prev_fire; end = start + timedelta(minutes=dur)
             if start <= now <= end: return m
-    return (cfg.get("meetings") or [None])[0]
+    return None
 
 class TelegramCommands:
     def __init__(self, cfg: Dict, logger):
@@ -45,9 +44,15 @@ class TelegramCommands:
                 async with s.get(url, params=params, timeout=10) as r:
                     data = await r.json()
                     for upd in data.get("result", []):
-                        self.last_update_id = max(self.last_update_id, upd["update_id"])
-                        await self.handle_update(upd)
-        except Exception: pass
+                        upd_id = int(upd["update_id"])
+                        try:
+                            await self.handle_update(upd)
+                        except Exception:
+                            self.logger.exception("TG message error")
+                        finally:
+                            self.last_update_id = max(self.last_update_id, upd_id)
+        except Exception:
+            self.logger.exception("TG poll error")
 
     async def handle_update(self, upd):
         msg = upd.get("message") or upd.get("channel_post") or {}

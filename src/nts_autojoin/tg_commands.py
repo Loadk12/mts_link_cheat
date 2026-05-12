@@ -13,6 +13,7 @@ from .notifier import notify, send_document, send_photo
 from .healthcheck import page_is_healthy
 from .live import get_any_page
 from .settings import get_logs_dir, load_config
+from .cron_helpers import next_fire_time, prev_fire_time
 BASE_DIR = Path(__file__).resolve().parents[2]
 OFFSET_FILE = BASE_DIR / "logs" / "tg_offset.state"
 STALE_SEC = 300  # игнор опасных команд старше 5 минут
@@ -67,9 +68,8 @@ def _occurrences_today(cron_expr: str, tzinfo) -> List[datetime]:
 def _next_occurrence(cron_expr: str, tzinfo):
     """Вернуть ближайшее срабатывание cron после текущего момента."""
 
-    trig = CronTrigger.from_crontab(cron_expr, timezone=tzinfo)
     now = datetime.now(tzinfo)
-    return trig.get_next_fire_time(None, now)
+    return next_fire_time(cron_expr, tzinfo, now)
 
 
 def _load_cfg() -> dict:
@@ -275,8 +275,7 @@ def _pick_current_meeting(
         if not cron:
             continue
         dur = int(m.get("duration_minutes", 45))
-        trig = CronTrigger.from_crontab(cron, timezone=tzinfo)
-        prev = trig.get_prev_fire_time(None, now)
+        prev = prev_fire_time(cron, tzinfo, now)
         if prev:
             start_dt = prev
             end_dt = start_dt + timedelta(minutes=dur)
@@ -295,8 +294,7 @@ def _pick_next_meeting(cfg: dict) -> Optional[Tuple[dict, datetime, datetime]]:
         if not cron:
             continue
         dur = int(m.get("duration_minutes", 45))
-        trig = CronTrigger.from_crontab(cron, timezone=tzinfo)
-        nxt = trig.get_next_fire_time(None, now)
+        nxt = next_fire_time(cron, tzinfo, now)
         if nxt and _meeting_active_on(m, nxt.date()):
             candidates.append((nxt, m, nxt + timedelta(minutes=dur)))
     if not candidates:
@@ -794,24 +792,30 @@ async def run_bot(
                 await asyncio.sleep(3)
                 continue
 
-            max_id = None
             for upd in data.get("result", []):
-                upd_id = upd["update_id"]
-                max_id = upd_id if (max_id is None or upd_id > max_id) else max_id
-                if upd.get("callback_query"):
-                    await handle_callback(upd)
-                    continue
-                msg = upd.get("message") or upd.get("edited_message")
-                if not msg:
-                    continue
-                chat_id = int(msg["chat"]["id"])
-                ts = int(msg.get("date", 0))
-                if "text" in msg:
-                    await handle(chat_id, msg["text"], ts, upd_id)
-
-            if max_id is not None:
-                offset = max_id + 1
-                _write_offset(offset)
+                upd_id = int(upd["update_id"])
+                try:
+                    if upd.get("callback_query"):
+                        try:
+                            await handle_callback(upd)
+                        except Exception:
+                            query = upd.get("callback_query") or {}
+                            await _answer_callback(cfg, query.get("id"), "Callback error.")
+                            logger.exception("TG callback error")
+                        continue
+                    msg = upd.get("message") or upd.get("edited_message")
+                    if not msg:
+                        continue
+                    chat_id = int(msg["chat"]["id"])
+                    ts = int(msg.get("date", 0))
+                    if "text" in msg:
+                        try:
+                            await handle(chat_id, msg["text"], ts, upd_id)
+                        except Exception:
+                            logger.exception("TG message error")
+                finally:
+                    offset = max(offset, upd_id + 1)
+                    _write_offset(offset)
 
         except asyncio.CancelledError:
             break
