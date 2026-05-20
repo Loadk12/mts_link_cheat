@@ -25,22 +25,34 @@ JOINED_JS = r"""
   const leaveHints = [
     "покинуть", "выйти", "завершить", "leave", "hang up", "end call",
   ];
+  const finalJoinHints = [
+    "присоединиться к встрече", "join meeting",
+  ];
   const controlHints = [
     "microphone", "camera", "video", "screensharing", "screen sharing",
     "микроф", "камер", "демонстрац", "экран", "поднять руку", "raise_hand", "raise hand",
   ];
 
+  const finalJoinButton = labels.some(label => finalJoinHints.some(h => label.includes(h)));
   const leaveButton = labels.some(label => leaveHints.some(h => label.includes(h)));
   const controlCount = labels.filter(label => controlHints.some(h => label.includes(h))).length;
   const chatInput = !!Array.from(document.querySelectorAll("[contenteditable='true'], textarea, input"))
     .find(el => visible(el) && /сообщ|message|chat|введите/.test(textOf(el)));
   const mediaLayout = !!Array.from(document.querySelectorAll("video, canvas, [data-testid*='Layout' i], [data-testid*='Webinar' i], [class*='webinar' i], [class*='conference' i], [class*='meeting' i]"))
     .find(visible);
+  const bodyText = norm(document.body ? document.body.innerText : "");
+  const deviceControl = /камера|микрофон|проверить звук|camera|microphone|audio input/.test(bodyText)
+    || labels.some(label => /камера|микрофон|camera|microphone/.test(label));
+  const devicePreview = !!Array.from(document.querySelectorAll("video, canvas, [class*='preview' i], [class*='avatar' i]")).find(visible);
   const urlLooksInside = /\/(event|webinar|meeting|room|session|call)\b/i.test(location.pathname)
     && !/landing|enter|login/i.test(location.pathname);
 
-  const joined = leaveButton || controlCount >= 2 || (mediaLayout && (chatInput || controlCount >= 1)) || (urlLooksInside && controlCount >= 1);
-  return { joined, leaveButton, controlCount, chatInput, mediaLayout, url: location.href };
+  if (finalJoinButton || (deviceControl && devicePreview && !leaveButton)) {
+    return { joined: false, finalJoinButton, deviceControl, devicePreview, leaveButton, controlCount, chatInput, mediaLayout, url: location.href };
+  }
+
+  const joined = leaveButton || (mediaLayout && (chatInput || controlCount >= 1)) || (urlLooksInside && leaveButton);
+  return { joined, finalJoinButton, deviceControl, devicePreview, leaveButton, controlCount, chatInput, mediaLayout, url: location.href };
 }
 """
 
@@ -72,9 +84,14 @@ JOIN_STATE_JS = r"""
   const labels = buttons.map(textOf);
 
   const joinHints = ["присоедин", "войти", "join", "enter"];
+  const finalJoinHints = ["присоединиться к встрече", "join meeting"];
   const joinButton = labels.some(label => joinHints.some(h => label.includes(h)));
+  const finalJoinButton = labels.some(label => finalJoinHints.some(h => label.includes(h)));
   const nameInput = !!document.querySelector("#name, input[name*='name' i], input[placeholder*='имя' i], input[placeholder*='name' i]");
   const landingForm = !!document.querySelector("#EventEnterForm") || (nameInput && joinButton);
+  const deviceControl = /камера|микрофон|проверить звук|camera|microphone|audio input/.test(bodyText)
+    || labels.some(label => /камера|микрофон|camera|microphone/.test(label));
+  const devicePreview = !!Array.from(document.querySelectorAll("video, canvas, [class*='preview' i], [class*='avatar' i]")).find(visible);
   const spinner = !!Array.from(document.querySelectorAll(
     "[role='progressbar'], [aria-busy='true'], .spinner, [class*='spinner' i], [class*='loader' i], [class*='loading' i], [data-testid*='loader' i], [data-testid*='loading' i]"
   )).find(visible);
@@ -85,7 +102,8 @@ JOIN_STATE_JS = r"""
     && !loadingText;
 
   let state = "unknown";
-  if (landingForm && joinButton) state = nameInput ? "landing" : "prejoin";
+  if (finalJoinButton || (deviceControl && devicePreview && joinButton)) state = "device_prejoin";
+  else if (landingForm && joinButton) state = nameInput ? "landing" : "prejoin";
   else if (spinner || loadingText || rootOnly || bodyLength < 20) state = "loading";
   else if (explicitError) state = "explicit_error";
 
@@ -95,7 +113,10 @@ JOIN_STATE_JS = r"""
     bodyLength,
     buttons: buttons.length,
     joinButton,
+    finalJoinButton,
     nameInput,
+    deviceControl,
+    devicePreview,
     spinner,
     loadingText,
     rootOnly,

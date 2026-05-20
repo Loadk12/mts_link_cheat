@@ -40,6 +40,7 @@ join_timeouts:
   post_join_grace_ms: 15000
   after_join_ms: 180000
   in_meeting_ms: 180000
+  final_join_after_click_ms: 180000
   state_poll_ms: 2000
 healthcheck:
   every_minutes: 5

@@ -75,6 +75,8 @@ async def _save_artifacts(page, prefix: str, tzname: str, logger) -> str:
                 tag: el.tagName.toLowerCase(),
                 type: el.getAttribute('type') || '',
                 text: (el.innerText || el.textContent || '').trim(),
+                disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                cls: el.getAttribute('class') || '',
                 aria: el.getAttribute('aria-label') || '',
                 title: el.getAttribute('title') || '',
                 testid: el.getAttribute('data-testid') || '',
@@ -86,6 +88,7 @@ async def _save_artifacts(page, prefix: str, tzname: str, logger) -> str:
             lines.append(
                 f"- #{item.get('index')} tag={item.get('tag')!r} type={item.get('type')!r} "
                 f"text={item.get('text')!r} "
+                f"disabled={item.get('disabled')!r} class={item.get('cls')!r} "
                 f"aria={item.get('aria')!r} title={item.get('title')!r} "
                 f"data-testid={item.get('testid')!r} placeholder={item.get('placeholder')!r}"
             )
