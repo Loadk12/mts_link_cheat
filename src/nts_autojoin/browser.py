@@ -64,6 +64,10 @@ async def create_browser(chromium_cfg: dict):
         viewport_height,
         args,
     )
+    if executable_path and "program files\\google\\chrome" in executable_path.lower():
+        logger.warning(
+            "browser launch uses system Google Chrome. For VPN/Happ isolation, use a separate Chrome for Testing executable_path."
+        )
 
     pw = await async_playwright().start()
 

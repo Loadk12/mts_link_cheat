@@ -19,7 +19,7 @@ system:
 chromium:
   visible_debug: true
   headless: false
-  executable_path: null
+  executable_path: C:\dev\mts_link_cheat\browsers\chrome-for-testing\chrome-win64\chrome.exe
   channel: null
   slow_mo_ms: 100
   viewport_width: 1400
