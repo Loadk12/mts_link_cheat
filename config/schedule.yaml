@@ -31,22 +31,17 @@ healthcheck:
   fail_threshold: 2
   indicators:
   - type: selector_exists
-    value: 'button[aria-label*="Покинуть встречу" i], [role="button"][aria-label*="Покинуть
-      встречу" i], button[aria-label="raise_hand"], [aria-label*="поднять руку" i],
-      [aria-label*="Одобрить" i], [aria-label*="Approve" i], [aria-label*="Leave meeting"
-      i]
-
-      '
+    value: button[aria-label*="Покинуть" i], [role="button"][aria-label*="Покинуть"
+      i], button[aria-label*="Выйти" i], [role="button"][aria-label*="Выйти" i], [aria-label*="Leave"
+      i], [aria-label*="End call" i], button[data-testid*="Microphone" i], button[data-testid*="Camera"
+      i], button[data-testid*="ScreenSharingButton" i], [aria-label*="микроф" i],
+      [aria-label*="камер" i], [aria-label*="поднять руку" i], [aria-label*="raise
+      hand" i]
   - type: selector_exists
-    value: button[data-testid*="ScreenSharingButton"]
-  - type: selector_exists
-    value: button[data-testid*="Microphone"], button[aria-label*="микроф" i], button[label*="микроф"
-      i]
-  - type: selector_exists
-    value: div[contenteditable="true"][data-placeholder="Введите сообщение"], div[contenteditable="true"][aria-label="Введите
-      сообщение"], [placeholder="Введите сообщение"]
-  - type: websocket_open
+    value: div[contenteditable="true"][data-placeholder*="сообщ" i], div[contenteditable="true"][aria-label*="сообщ"
+      i], [placeholder*="сообщ" i], [aria-label*="message" i]
   - type: webrtc_active
+  - type: websocket_open
 default_join:
   steps:
   - action: wait
@@ -56,340 +51,88 @@ default_join:
     selector: '#name'
   - action: fill
     selector: '#name'
-    value: Р›СѓС…РЅРµРІ РћР»РµРі 231-363
+    value: Лухнев Олег 231-363
   - action: press
     selector: '#name'
     value: Tab
-  - action: wait
-    selector: button[data-testid='EventLanding.enter-to-event']:not([disabled])
+  - action: wait_any
+    selectors:
+    - button[data-testid="EventLanding.enter-to-event"]:not([disabled])
+    - button[data-testid*="enter-to-event" i]:not([disabled])
+    - button[aria-label*="Войти" i]:not([disabled])
+    - button[aria-label*="Join" i]:not([disabled])
     timeout_ms: 8000
-  - action: click
-    selector: button[data-testid='EventLanding.enter-to-event']
+  - action: click_any
+    selectors: &id001
+    - button[data-testid="EventLanding.enter-to-event"]
+    - button[data-testid*="enter-to-event" i]
+    - button[data-testid*="join" i]
+    - button[aria-label*="Присоедин" i]
+    - button[aria-label*="Войти" i]
+    - button[aria-label*="Join" i]
+    - button:has-text("Присоединиться к встрече")
+    - button:has-text("Войти")
+    - button:has-text("Join")
+    timeout_ms: 8000
   - action: maybe_click
-    selector: button[aria-label*="Р’С‹РєР»СЋС‡РёС‚СЊ РјРёРєСЂРѕС„РѕРЅ" i]
+    selector: button[aria-label*="Выключить микрофон" i]
   - action: maybe_click
-    selector: button[aria-label*="Р’С‹РєР»СЋС‡РёС‚СЊ РєР°РјРµСЂСѓ" i]
-  - action: wait
-    selector: button:has-text("РџСЂРёСЃРѕРµРґРёРЅРёС‚СЊСЃСЏ Рє РІСЃС‚СЂРµС‡Рµ")
+    selector: button[aria-label*="Выключить камеру" i]
+  - action: click_any
+    selectors: *id001
     timeout_ms: 15000
-  - action: click
-    selector: button:has-text("РџСЂРёСЃРѕРµРґРёРЅРёС‚СЊСЃСЏ Рє РІСЃС‚СЂРµС‡Рµ")
   - action: sleep
     value: 1200
   - action: maybe_click
-    selector: button[aria-label*="Р’С‹РєР»СЋС‡РёС‚СЊ РјРёРєСЂРѕС„РѕРЅ" i]
+    selector: button[aria-label*="Выключить микрофон" i]
   - action: maybe_click
-    selector: button[aria-label*="Р’С‹РєР»СЋС‡РёС‚СЊ РєР°РјРµСЂСѓ" i]
+    selector: button[aria-label*="Выключить камеру" i]
 meetings:
 - name: Проектирование интернет-приложений (Лекция)
   url: https://my.mts-link.ru/j/19400763/7931368744/session/7625531348
   cron: 20 12 * * tue
   duration_minutes: 90
-  start_date: 2025-09-02       # первая пара
-  end_date: 2025-11-02         # последняя пара
-  join:
-    steps:
-    - action: wait
-      selector: '#EventEnterForm'
-      timeout_ms: 20000
-    - action: click
-      selector: '#name'
-    - action: fill
-      selector: '#name'
-      value: Лухнев Олег 231-363
-    - action: press
-      selector: '#name'
-      value: Tab
-    - action: wait
-      selector: button[data-testid='EventLanding.enter-to-event']:not([disabled])
-      timeout_ms: 8000
-    - action: click
-      selector: button[data-testid='EventLanding.enter-to-event']
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
-    - action: wait
-      selector: button:has-text("Присоединиться к встрече")
-      timeout_ms: 15000
-    - action: click
-      selector: button:has-text("Присоединиться к встрече")
-    - action: sleep
-      value: 1200
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
+  start_date: 2025-09-02
+  end_date: 2025-11-02
 - name: Высокопроизводительные вычисления (Лекция)
   url: https://my.mts-link.ru/j/19400763/7931368744/session/7625531348
   cron: 20 12 * * tue
   duration_minutes: 90
-  start_date: 2025-11-03       # первая пара
-  end_date: 2026-01-04         # последняя пара
-  join:
-    steps:
-    - action: wait
-      selector: '#EventEnterForm'
-      timeout_ms: 20000
-    - action: click
-      selector: '#name'
-    - action: fill
-      selector: '#name'
-      value: Лухнев Олег 231-363
-    - action: press
-      selector: '#name'
-      value: Tab
-    - action: wait
-      selector: button[data-testid='EventLanding.enter-to-event']:not([disabled])
-      timeout_ms: 8000
-    - action: click
-      selector: button[data-testid='EventLanding.enter-to-event']
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
-    - action: wait
-      selector: button:has-text("Присоединиться к встрече")
-      timeout_ms: 15000
-    - action: click
-      selector: button:has-text("Присоединиться к встрече")
-    - action: sleep
-      value: 1200
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
+  start_date: 2025-11-03
+  end_date: 2026-01-04
 - name: Электронный бизнес (Лекция)
   url: https://my.mts-link.ru/j/19400927/7931431826/session/7625583409
   cron: 30 14 * * tue
   duration_minutes: 90
-  start_date: 2025-09-01       # первая пара
-  end_date: 2026-01-04         # последняя пара
-  join:
-    steps:
-    - action: wait
-      selector: '#EventEnterForm'
-      timeout_ms: 20000
-    - action: click
-      selector: '#name'
-    - action: fill
-      selector: '#name'
-      value: Лухнев Олег 231-363
-    - action: press
-      selector: '#name'
-      value: Tab
-    - action: wait
-      selector: button[data-testid='EventLanding.enter-to-event']:not([disabled])
-      timeout_ms: 8000
-    - action: click
-      selector: button[data-testid='EventLanding.enter-to-event']
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
-    - action: wait
-      selector: button:has-text("Присоединиться к встрече")
-      timeout_ms: 15000
-    - action: click
-      selector: button:has-text("Присоединиться к встрече")
-    - action: sleep
-      value: 1200
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
+  start_date: 2025-09-01
+  end_date: 2026-01-04
 - name: Нейронные сети (Лекция)
   url: https://my.mts-link.ru/j/19399433/6593192072/session/6354312243
   cron: 0 9 * * wed
   duration_minutes: 90
-  start_date: 2025-09-01       # первая пара
-  end_date: 2025-11-02         # последняя пара
-  join:
-    steps:
-    - action: wait
-      selector: '#EventEnterForm'
-      timeout_ms: 20000
-    - action: click
-      selector: '#name'
-    - action: fill
-      selector: '#name'
-      value: Лухнев Олег 231-363
-    - action: press
-      selector: '#name'
-      value: Tab
-    - action: wait
-      selector: button[data-testid='EventLanding.enter-to-event']:not([disabled])
-      timeout_ms: 8000
-    - action: click
-      selector: button[data-testid='EventLanding.enter-to-event']
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
-    - action: wait
-      selector: button:has-text("Присоединиться к встрече")
-      timeout_ms: 15000
-    - action: click
-      selector: button:has-text("Присоединиться к встрече")
-    - action: sleep
-      value: 1200
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
+  start_date: 2025-09-01
+  end_date: 2025-11-02
 - name: Нейронные сети (Лекция)
   url: https://my.mts-link.ru/j/19399433/6593192072/session/6354312243
   cron: 40 10 * * wed
   duration_minutes: 90
-  start_date: 2025-09-01       # первая пара
-  end_date: 2025-11-02         # последняя пара
-  join:
-    steps:
-    - action: wait
-      selector: '#EventEnterForm'
-      timeout_ms: 20000
-    - action: click
-      selector: '#name'
-    - action: fill
-      selector: '#name'
-      value: Лухнев Олег 231-363
-    - action: press
-      selector: '#name'
-      value: Tab
-    - action: wait
-      selector: button[data-testid='EventLanding.enter-to-event']:not([disabled])
-      timeout_ms: 8000
-    - action: click
-      selector: button[data-testid='EventLanding.enter-to-event']
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
-    - action: wait
-      selector: button:has-text("Присоединиться к встрече")
-      timeout_ms: 15000
-    - action: click
-      selector: button:has-text("Присоединиться к встрече")
-    - action: sleep
-      value: 1200
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
+  start_date: 2025-09-01
+  end_date: 2025-11-02
 - name: Инструменты визуализации данных (Лекция)
   url: https://my.mts-link.ru/j/19396923/6593357922/session/6354479690
   cron: 20 12 * * wed
   duration_minutes: 90
-  start_date: 2025-09-01       # первая пара
-  end_date: 2025-11-02         # последняя пара
-  join:
-    steps:
-    - action: wait
-      selector: '#EventEnterForm'
-      timeout_ms: 20000
-    - action: click
-      selector: '#name'
-    - action: fill
-      selector: '#name'
-      value: Лухнев Олег 231-363
-    - action: press
-      selector: '#name'
-      value: Tab
-    - action: wait
-      selector: button[data-testid='EventLanding.enter-to-event']:not([disabled])
-      timeout_ms: 8000
-    - action: click
-      selector: button[data-testid='EventLanding.enter-to-event']
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
-    - action: wait
-      selector: button:has-text("Присоединиться к встрече")
-      timeout_ms: 15000
-    - action: click
-      selector: button:has-text("Присоединиться к встрече")
-    - action: sleep
-      value: 1200
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
+  start_date: 2025-09-01
+  end_date: 2025-11-02
 - name: Инструменты визуализации данных (Лаб.работа)
   url: https://my.mts-link.ru/j/17322013/6839244634
   cron: 40 10 * * wed
   duration_minutes: 90
-  start_date: 2025-09-01       # первая пара
-  end_date: 2025-11-02         # последняя пара
-  join:
-    steps:
-    - action: wait
-      selector: '#EventEnterForm'
-      timeout_ms: 20000
-    - action: click
-      selector: '#name'
-    - action: fill
-      selector: '#name'
-      value: Лухнев Олег 231-363
-    - action: press
-      selector: '#name'
-      value: Tab
-    - action: wait
-      selector: button[data-testid='EventLanding.enter-to-event']:not([disabled])
-      timeout_ms: 8000
-    - action: click
-      selector: button[data-testid='EventLanding.enter-to-event']
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
-    - action: wait
-      selector: button:has-text("Присоединиться к встрече")
-      timeout_ms: 15000
-    - action: click
-      selector: button:has-text("Присоединиться к встрече")
-    - action: sleep
-      value: 1200
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
+  start_date: 2025-09-01
+  end_date: 2025-11-02
 - name: Инструменты визуализации данных (Лаб.работа)
   url: https://my.mts-link.ru/j/17322013/6839244634
   cron: 20 12 * * wed
   duration_minutes: 90
-  start_date: 2025-09-01       # первая пара
-  end_date: 2025-11-02         # последняя пара
-  join:
-    steps:
-    - action: wait
-      selector: '#EventEnterForm'
-      timeout_ms: 20000
-    - action: click
-      selector: '#name'
-    - action: fill
-      selector: '#name'
-      value: Лухнев Олег 231-363
-    - action: press
-      selector: '#name'
-      value: Tab
-    - action: wait
-      selector: button[data-testid='EventLanding.enter-to-event']:not([disabled])
-      timeout_ms: 8000
-    - action: click
-      selector: button[data-testid='EventLanding.enter-to-event']
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
-    - action: wait
-      selector: button:has-text("Присоединиться к встрече")
-      timeout_ms: 15000
-    - action: click
-      selector: button:has-text("Присоединиться к встрече")
-    - action: sleep
-      value: 1200
-    - action: maybe_click
-      selector: button[aria-label*="Выключить микрофон" i]
-    - action: maybe_click
-      selector: button[aria-label*="Выключить камеру" i]
+  start_date: 2025-09-01
+  end_date: 2025-11-02

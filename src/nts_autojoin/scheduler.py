@@ -11,7 +11,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from .browser import create_browser
 from .join_flow import perform_join, ensure_media_disabled
-from .healthcheck import page_is_healthy
+from .healthcheck import is_joined_to_meeting, page_is_healthy
 from .live import set_page, clear_page
 from .notifier import notify, send_photo
 from .settings import get_logs_dir
@@ -68,6 +68,26 @@ async def _save_artifacts(page, prefix: str, tzname: str, logger) -> str:
         base.with_suffix(".html").write_text(html, encoding="utf-8", errors="ignore")
     except Exception as e:
         logger.warning(f"artifact html save failed: {e}")
+    try:
+        buttons = await page.locator("button, [role='button']").evaluate_all(
+            """els => els.slice(0, 80).map((el, i) => ({
+                index: i,
+                text: (el.innerText || el.textContent || '').trim(),
+                aria: el.getAttribute('aria-label') || '',
+                title: el.getAttribute('title') || '',
+                testid: el.getAttribute('data-testid') || ''
+            }))"""
+        )
+        lines = [f"url: {page.url}", "", "buttons:"]
+        for item in buttons:
+            lines.append(
+                f"- #{item.get('index')} text={item.get('text')!r} "
+                f"aria={item.get('aria')!r} title={item.get('title')!r} "
+                f"data-testid={item.get('testid')!r}"
+            )
+        base.with_suffix(".txt").write_text("\n".join(lines), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"artifact diagnostics save failed: {e}")
     return str(base)
 
 
@@ -116,18 +136,30 @@ async def _run_meeting_attempt(
         set_page(name, page)
 
         await page.goto(url, wait_until="domcontentloaded")
+        logger.info(f"[{name}] opening landing page: {page.url}")
         already_joined = False
         try:
-            already_joined = await page_is_healthy(page, hc_cfg)
+            already_joined = await is_joined_to_meeting(page)
             if already_joined:
-                logger.info(
-                    f"[{name}] похоже, уже в встрече — пропускаю шаги join."
-                )
+                logger.info(f"[{name}] detected in-meeting UI before join; skipping join steps.")
         except Exception as e:
-            logger.warning(f"[{name}] healthcheck перед join не сработал: {e}")
+            logger.warning(f"[{name}] pre-join meeting detection failed: {e}")
 
         if join_cfg and not already_joined:
-            await perform_join(page, join_cfg)
+            try:
+                joined = await perform_join(page, join_cfg, logger=logger)
+                if joined:
+                    logger.info(f"[{name}] join success.")
+                elif await is_joined_to_meeting(page):
+                    logger.warning(f"[{name}] join flow returned false, but meeting UI is visible; continuing.")
+                else:
+                    raise TimeoutError("join flow finished without detecting meeting UI")
+            except Exception as e:
+                if await is_joined_to_meeting(page):
+                    logger.warning(f"[{name}] join timeout/error but already inside meeting; continuing: {e}")
+                else:
+                    logger.warning(f"[{name}] join failed: {e}")
+                    raise
         try:
             await ensure_media_disabled(page)
         except Exception as e:
@@ -191,6 +223,12 @@ async def _run_meeting_attempt(
 
     except Exception as e:
         logger.error(f"[{name}] meeting error: {e}")
+        try:
+            if page is not None and await is_joined_to_meeting(page):
+                logger.warning(f"[{name}] join failed with timeout/error, but meeting UI is visible; continuing.")
+                return True
+        except Exception:
+            pass
         if page is not None:
             base = await _save_artifacts(page, prefix, tzname, logger)
             try:

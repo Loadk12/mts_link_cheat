@@ -1,4 +1,50 @@
 import json
+
+
+JOINED_JS = r"""
+() => {
+  const visible = (el) => {
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+  };
+  const norm = (value) => (value || "").toLowerCase();
+  const textOf = (el) => norm([
+    el.getAttribute("aria-label"),
+    el.getAttribute("label"),
+    el.getAttribute("title"),
+    el.getAttribute("data-testid"),
+    el.innerText,
+    el.textContent,
+  ].filter(Boolean).join(" "));
+
+  const buttons = Array.from(document.querySelectorAll("button, [role='button'], [aria-label], [data-testid]"))
+    .filter(visible);
+  const labels = buttons.map(textOf);
+
+  const leaveHints = [
+    "покинуть", "выйти", "завершить", "leave", "hang up", "end call",
+  ];
+  const controlHints = [
+    "microphone", "camera", "video", "screensharing", "screen sharing",
+    "микроф", "камер", "демонстрац", "экран", "поднять руку", "raise_hand", "raise hand",
+  ];
+
+  const leaveButton = labels.some(label => leaveHints.some(h => label.includes(h)));
+  const controlCount = labels.filter(label => controlHints.some(h => label.includes(h))).length;
+  const chatInput = !!Array.from(document.querySelectorAll("[contenteditable='true'], textarea, input"))
+    .find(el => visible(el) && /сообщ|message|chat|введите/.test(textOf(el)));
+  const mediaLayout = !!Array.from(document.querySelectorAll("video, canvas, [data-testid*='Layout' i], [data-testid*='Webinar' i], [class*='webinar' i], [class*='conference' i], [class*='meeting' i]"))
+    .find(visible);
+  const urlLooksInside = /\/(event|webinar|meeting|room|session|call)\b/i.test(location.pathname)
+    && !/landing|enter|login/i.test(location.pathname);
+
+  const joined = leaveButton || controlCount >= 2 || (mediaLayout && (chatInput || controlCount >= 1)) || (urlLooksInside && controlCount >= 1);
+  return { joined, leaveButton, controlCount, chatInput, mediaLayout, url: location.href };
+}
+"""
+
+
 HEALTH_JS = r"""
 () => new Promise(async (resolve) => {
   try {
@@ -46,29 +92,40 @@ HEALTH_JS = r"""
   } catch (e) { resolve({error: String(e)}) }
 });
 """
+
+
+async def is_joined_to_meeting(page) -> bool:
+    try:
+        res = await page.evaluate(JOINED_JS)
+        return bool(res.get("joined"))
+    except Exception:
+        return False
+
+
 async def page_is_healthy(page, hc_cfg: dict) -> bool:
+    if await is_joined_to_meeting(page):
+        return True
+
     indicators = hc_cfg.get("indicators", [])
     selector_values = []
     want_ws = want_webrtc = False
     for ind in indicators:
         t = ind.get("type")
         if t == "selector_exists":
-            vals = [s.strip() for s in ind.get("value","").split(",") if s.strip()]
+            vals = [s.strip() for s in ind.get("value", "").split(",") if s.strip()]
             selector_values.extend(vals)
         elif t == "websocket_open":
             want_ws = True
         elif t == "webrtc_active":
             want_webrtc = True
+
     js = HEALTH_JS.replace("__INDICATOR_SELECTORS__", json.dumps(selector_values))
     try:
         res = await page.evaluate(js)
-        strong_configured = bool(selector_values or want_webrtc)
-        strong_ok = False
-        if selector_values and res.get("selector_ok"): strong_ok = True
-        if want_webrtc and res.get("webrtc_active"): strong_ok = True
-        if strong_configured:
-            return strong_ok
-        if want_ws and res.get("ws_open"): return True
+        if selector_values and res.get("selector_ok"):
+            return True
+        if want_webrtc and res.get("webrtc_active"):
+            return True
         return False
     except Exception:
         return False
