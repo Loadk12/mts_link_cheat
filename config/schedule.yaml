@@ -30,6 +30,15 @@ chromium:
   - --use-file-for-fake-video-capture=assets\black.y4m
   - --use-file-for-fake-audio-capture=assets\silence.wav
   - --autoplay-policy=no-user-gesture-required
+join_timeouts:
+  page_goto_ms: 120000
+  landing_ms: 120000
+  name_input_ms: 120000
+  join_button_ms: 120000
+  post_join_grace_ms: 15000
+  after_join_ms: 180000
+  in_meeting_ms: 180000
+  state_poll_ms: 2000
 healthcheck:
   every_minutes: 5
   fail_threshold: 2

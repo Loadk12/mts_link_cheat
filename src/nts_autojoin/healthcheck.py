@@ -45,6 +45,66 @@ JOINED_JS = r"""
 """
 
 
+JOIN_STATE_JS = r"""
+() => {
+  const visible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+  };
+  const norm = (value) => (value || "").toLowerCase();
+  const textOf = (el) => norm([
+    el.getAttribute("aria-label"),
+    el.getAttribute("label"),
+    el.getAttribute("title"),
+    el.getAttribute("data-testid"),
+    el.getAttribute("placeholder"),
+    el.innerText,
+    el.textContent,
+  ].filter(Boolean).join(" "));
+
+  const bodyText = norm(document.body ? document.body.innerText : "");
+  const bodyLength = bodyText.trim().length;
+  const url = location.href;
+  const buttons = Array.from(document.querySelectorAll("button, [role='button']"))
+    .filter(visible);
+  const labels = buttons.map(textOf);
+
+  const joinHints = ["присоедин", "войти", "join", "enter"];
+  const joinButton = labels.some(label => joinHints.some(h => label.includes(h)));
+  const nameInput = !!document.querySelector("#name, input[name*='name' i], input[placeholder*='имя' i], input[placeholder*='name' i]");
+  const landingForm = !!document.querySelector("#EventEnterForm") || (nameInput && joinButton);
+  const spinner = !!Array.from(document.querySelectorAll(
+    "[role='progressbar'], [aria-busy='true'], .spinner, [class*='spinner' i], [class*='loader' i], [class*='loading' i], [data-testid*='loader' i], [data-testid*='loading' i]"
+  )).find(visible);
+  const loadingText = /загруз|подожд|loading|connecting|подключ|инициализац/.test(bodyText);
+  const rootOnly = !!document.querySelector("#root, #app, [data-reactroot]") && buttons.length === 0 && bodyLength < 80;
+
+  const explicitError = /ошибка|не удалось|нет доступа|доступ запрещ|встреча заверш|мероприятие заверш|error|failed|denied|not found/.test(bodyText)
+    && !loadingText;
+
+  let state = "unknown";
+  if (landingForm && joinButton) state = nameInput ? "landing" : "prejoin";
+  else if (spinner || loadingText || rootOnly || bodyLength < 20) state = "loading";
+  else if (explicitError) state = "explicit_error";
+
+  return {
+    state,
+    url,
+    bodyLength,
+    buttons: buttons.length,
+    joinButton,
+    nameInput,
+    spinner,
+    loadingText,
+    rootOnly,
+    sample: bodyText.slice(0, 240),
+  };
+}
+"""
+
+
 HEALTH_JS = r"""
 () => new Promise(async (resolve) => {
   try {
@@ -100,6 +160,18 @@ async def is_joined_to_meeting(page) -> bool:
         return bool(res.get("joined"))
     except Exception:
         return False
+
+
+async def detect_join_state(page) -> dict:
+    try:
+        if await is_joined_to_meeting(page):
+            return {"state": "joined", "url": page.url}
+        res = await page.evaluate(JOIN_STATE_JS)
+        if not isinstance(res, dict):
+            return {"state": "unknown", "url": page.url}
+        return res
+    except Exception as e:
+        return {"state": "closed", "error": str(e)}
 
 
 async def page_is_healthy(page, hc_cfg: dict) -> bool:

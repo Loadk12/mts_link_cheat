@@ -1,6 +1,18 @@
+import time
 from typing import Any, Dict, List
 
-from .healthcheck import is_joined_to_meeting
+from .healthcheck import detect_join_state, is_joined_to_meeting
+
+
+DEFAULT_JOIN_TIMEOUTS = {
+    "landing_ms": 120000,
+    "name_input_ms": 120000,
+    "join_button_ms": 120000,
+    "post_join_grace_ms": 15000,
+    "after_join_ms": 180000,
+    "in_meeting_ms": 180000,
+    "state_poll_ms": 2000,
+}
 
 
 MIC_SELECTORS = [
@@ -77,6 +89,13 @@ async def _click_any(page, selectors: List[str], timeout_ms: int):
     raise TimeoutError(f"click_any: did not find any selector from: {selectors}")
 
 
+def _timeouts(join_cfg: Dict[str, Any], overrides: Dict[str, Any] | None) -> Dict[str, int]:
+    merged = dict(DEFAULT_JOIN_TIMEOUTS)
+    merged.update(join_cfg.get("timeouts") or {})
+    merged.update(overrides or {})
+    return {k: int(v) for k, v in merged.items() if v is not None}
+
+
 def _log(logger, message: str):
     if logger:
         logger.info(message)
@@ -87,6 +106,20 @@ def _step_label(step: Dict[str, Any]) -> str:
     return f"{step.get('action')} {selector}".strip()
 
 
+def _looks_like_join_selector(selector: str) -> bool:
+    lower = (selector or "").lower()
+    return any(
+        hint in lower
+        for hint in (
+            "enter-to-event",
+            "join",
+            "присоедин",
+            "войти",
+            "eventlanding",
+        )
+    )
+
+
 async def _finish_if_joined(page, logger, label: str) -> bool:
     if await is_joined_to_meeting(page):
         _log(logger, f"detected in-meeting UI after {label}; join success")
@@ -94,12 +127,68 @@ async def _finish_if_joined(page, logger, label: str) -> bool:
     return False
 
 
-async def perform_join(page, join_cfg: Dict[str, Any], logger=None):
+async def wait_post_join_transition(page, timeouts: Dict[str, int], logger=None) -> bool:
+    grace_ms = int(timeouts.get("post_join_grace_ms", 15000))
+    after_join_ms = int(timeouts.get("after_join_ms", 180000))
+    in_meeting_ms = int(timeouts.get("in_meeting_ms", after_join_ms))
+    poll_ms = int(timeouts.get("state_poll_ms", 2000))
+    deadline_ms = time.monotonic() * 1000 + max(after_join_ms, in_meeting_ms)
+    grace_deadline_ms = time.monotonic() * 1000 + grace_ms
+    start = time.monotonic()
+
+    _log(logger, f"post-join grace started {grace_ms}ms")
+    _log(logger, f"waiting in-meeting UI up to {max(after_join_ms, in_meeting_ms)}ms")
+
+    while time.monotonic() * 1000 < deadline_ms:
+        if await is_joined_to_meeting(page):
+            elapsed = int(time.monotonic() - start)
+            _log(logger, f"joined detected after {elapsed}s")
+            return True
+
+        state_info = await detect_join_state(page)
+        state = state_info.get("state", "unknown")
+        elapsed = int(time.monotonic() - start)
+        _log(
+            logger,
+            "post join state: "
+            f"{state} elapsed={elapsed}s url={state_info.get('url', '')} "
+            f"buttons={state_info.get('buttons', '-')}",
+        )
+
+        if state == "joined":
+            _log(logger, f"joined detected after {elapsed}s")
+            return True
+        if state == "closed":
+            raise TimeoutError(f"browser/page closed during post-join wait: {state_info.get('error', '')}")
+        if state == "explicit_error" and time.monotonic() * 1000 > grace_deadline_ms:
+            raise TimeoutError(f"explicit join error on page: {state_info.get('sample', '')}")
+
+        if (
+            state in ("landing", "prejoin")
+            and state_info.get("joinButton")
+            and time.monotonic() * 1000 > grace_deadline_ms
+        ):
+            _log(logger, "post-join wait found another join/prejoin button; continuing configured join steps")
+            return False
+
+        await page.wait_for_timeout(poll_ms)
+
+    if await is_joined_to_meeting(page):
+        elapsed = int(time.monotonic() - start)
+        _log(logger, f"joined detected after {elapsed}s at timeout boundary")
+        return True
+    elapsed = int(time.monotonic() - start)
+    _log(logger, f"post-join timeout after {elapsed}s")
+    return False
+
+
+async def perform_join(page, join_cfg: Dict[str, Any], logger=None, timeouts: Dict[str, Any] | None = None):
     """
     Execute configured join steps. If the webinar UI is detected at any point,
     stop immediately and report success instead of waiting for pre-join controls.
     """
     _log(logger, "opening landing page / starting join flow")
+    join_timeouts = _timeouts(join_cfg, timeouts)
     if await _finish_if_joined(page, logger, "initial page"):
         return True
 
@@ -107,6 +196,12 @@ async def perform_join(page, join_cfg: Dict[str, Any], logger=None):
     for step in steps:
         action = step.get("action")
         timeout_ms = int(step.get("timeout_ms", 15000))
+        if action == "wait" and step.get("selector") == "#EventEnterForm":
+            timeout_ms = max(timeout_ms, join_timeouts.get("landing_ms", timeout_ms))
+        if action in ("click", "click_any", "wait_any"):
+            timeout_ms = max(timeout_ms, join_timeouts.get("join_button_ms", timeout_ms))
+        if action in ("fill", "maybe_fill") and step.get("selector") == "#name":
+            timeout_ms = max(timeout_ms, join_timeouts.get("name_input_ms", timeout_ms))
         label = _step_label(step)
 
         if await _finish_if_joined(page, logger, f"before {label}"):
@@ -148,13 +243,20 @@ async def perform_join(page, join_cfg: Dict[str, Any], logger=None):
             _log(logger, f"clicking join/control selector: {selector}")
             await page.wait_for_selector(selector, timeout=timeout_ms)
             await page.click(selector)
+            if _looks_like_join_selector(selector):
+                _log(logger, "clicked join button")
+                if await wait_post_join_transition(page, join_timeouts, logger=logger):
+                    return True
 
         elif action == "click_any":
             selectors: List[str] = step.get("selectors", [])
             if not selectors:
                 continue
             _log(logger, f"clicking first available selector: {selectors}")
-            await _click_any(page, selectors, timeout_ms)
+            clicked_selector = await _click_any(page, selectors, timeout_ms)
+            _log(logger, f"clicked join button: {clicked_selector}")
+            if await wait_post_join_transition(page, join_timeouts, logger=logger):
+                return True
 
         elif action == "maybe_click":
             selector = step["selector"]

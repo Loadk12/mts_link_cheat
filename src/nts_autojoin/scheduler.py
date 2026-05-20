@@ -69,21 +69,25 @@ async def _save_artifacts(page, prefix: str, tzname: str, logger) -> str:
     except Exception as e:
         logger.warning(f"artifact html save failed: {e}")
     try:
-        buttons = await page.locator("button, [role='button']").evaluate_all(
+        controls = await page.locator("button, [role='button'], input, textarea").evaluate_all(
             """els => els.slice(0, 80).map((el, i) => ({
                 index: i,
+                tag: el.tagName.toLowerCase(),
+                type: el.getAttribute('type') || '',
                 text: (el.innerText || el.textContent || '').trim(),
                 aria: el.getAttribute('aria-label') || '',
                 title: el.getAttribute('title') || '',
-                testid: el.getAttribute('data-testid') || ''
+                testid: el.getAttribute('data-testid') || '',
+                placeholder: el.getAttribute('placeholder') || ''
             }))"""
         )
-        lines = [f"url: {page.url}", "", "buttons:"]
-        for item in buttons:
+        lines = [f"url: {page.url}", "", "buttons/inputs:"]
+        for item in controls:
             lines.append(
-                f"- #{item.get('index')} text={item.get('text')!r} "
+                f"- #{item.get('index')} tag={item.get('tag')!r} type={item.get('type')!r} "
+                f"text={item.get('text')!r} "
                 f"aria={item.get('aria')!r} title={item.get('title')!r} "
-                f"data-testid={item.get('testid')!r}"
+                f"data-testid={item.get('testid')!r} placeholder={item.get('placeholder')!r}"
             )
         base.with_suffix(".txt").write_text("\n".join(lines), encoding="utf-8")
     except Exception as e:
@@ -107,6 +111,80 @@ async def _send_success_screenshot(page, prefix: str, tzname: str, cfg: dict, na
             pass
     except Exception as e:
         logger.warning(f"[{name}] не удалось отправить скриншот после входа: {e}")
+
+
+async def _hold_meeting_until_deadline(
+    page,
+    name: str,
+    hc_cfg: dict,
+    global_cfg: dict,
+    logger,
+    stop_event: asyncio.Event,
+    deadline: datetime,
+    fail_threshold: int,
+    every_minutes: int,
+    prefix: str,
+    attempt: int,
+    total_attempts: int,
+    tzname: str,
+) -> bool:
+    consecutive_failures = 0
+    ever_healthy = False
+
+    while True:
+        if stop_event.is_set():
+            await notify(global_cfg, f"⏹️ [{name}] остановлен вручную.")
+            return True
+
+        now = _now(tzname)
+        if now >= deadline:
+            await notify(global_cfg, f"⏹️ [{name}] время вышло, выхожу.")
+            return True
+
+        try:
+            ok = await page_is_healthy(page, hc_cfg)
+        except Exception as e:
+            logger.warning(f"[{name}] healthcheck error: {e}")
+            ok = False
+
+        if ok:
+            ever_healthy = True
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            logger.warning(
+                f"[{name}] healthcheck FAIL "
+                f"({consecutive_failures}/{fail_threshold})"
+            )
+            base = await _save_artifacts(page, prefix, tzname, logger)
+            try:
+                await send_photo(
+                    global_cfg,
+                    f"{base}.png",
+                    caption=f"⛔ [{name}] healthcheck fail (попытка {attempt}/{total_attempts})",
+                )
+            except Exception:
+                pass
+            if consecutive_failures >= fail_threshold:
+                if await is_joined_to_meeting(page):
+                    logger.warning(f"[{name}] healthcheck failed, but in-meeting UI is visible; continuing.")
+                    consecutive_failures = 0
+                else:
+                    await notify(
+                        global_cfg,
+                        f"⛔ [{name}] здоровье страницы упало, перезапускаю попытку.",
+                    )
+                    return False
+
+        sleep_for = max(30, every_minutes * 60)
+        remaining = max(0, (deadline - _now(tzname)).total_seconds())
+        timeout = min(sleep_for, remaining) if remaining else sleep_for
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+
+    return True if ever_healthy else False
 
 
 async def _run_meeting_attempt(
@@ -138,7 +216,10 @@ async def _run_meeting_attempt(
         page = await context.new_page()
         set_page(name, page)
 
-        await page.goto(url, wait_until="domcontentloaded")
+        join_timeouts = global_cfg.get("join_timeouts", {}) or {}
+        page_goto_ms = int(join_timeouts.get("page_goto_ms", 120000))
+
+        await page.goto(url, wait_until="domcontentloaded", timeout=page_goto_ms)
         logger.info(f"[{name}] opening landing page: {page.url}")
         already_joined = False
         try:
@@ -150,7 +231,7 @@ async def _run_meeting_attempt(
 
         if join_cfg and not already_joined:
             try:
-                joined = await perform_join(page, join_cfg, logger=logger)
+                joined = await perform_join(page, join_cfg, logger=logger, timeouts=join_timeouts)
                 if joined:
                     logger.info(f"[{name}] join success.")
                 elif await is_joined_to_meeting(page):
@@ -172,64 +253,42 @@ async def _run_meeting_attempt(
             _send_success_screenshot(page, prefix, tzname, global_cfg, name, logger)
         )
 
-        consecutive_failures = 0
-        ever_healthy = False
-
-        while True:
-            if stop_event.is_set():
-                await notify(global_cfg, f"⏹️ [{name}] остановлен вручную.")
-                return True
-
-            now = _now(tzname)
-            if now >= deadline:
-                await notify(global_cfg, f"⏹️ [{name}] время вышло, выхожу.")
-                return True
-
-            try:
-                ok = await page_is_healthy(page, hc_cfg)
-            except Exception as e:
-                logger.warning(f"[{name}] healthcheck error: {e}")
-                ok = False
-
-            if ok:
-                ever_healthy = True
-                consecutive_failures = 0
-            else:
-                consecutive_failures += 1
-                logger.warning(
-                    f"[{name}] healthcheck FAIL "
-                    f"({consecutive_failures}/{fail_threshold})"
-                )
-                base = await _save_artifacts(page, prefix, tzname, logger)
-                try:
-                    await send_photo(
-                        global_cfg,
-                        f"{base}.png",
-                        caption=f"⛔ [{name}] healthcheck fail (попытка {attempt}/{total_attempts})",
-                    )
-                except Exception:
-                    pass
-                if consecutive_failures >= fail_threshold:
-                    await notify(
-                        global_cfg,
-                        f"⛔ [{name}] здоровье страницы упало, перезапускаю попытку.",
-                    )
-                    return False
-
-            sleep_for = max(30, every_minutes * 60)
-            remaining = max(0, (deadline - _now(tzname)).total_seconds())
-            timeout = min(sleep_for, remaining) if remaining else sleep_for
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                pass
+        return await _hold_meeting_until_deadline(
+            page,
+            name,
+            hc_cfg,
+            global_cfg,
+            logger,
+            stop_event,
+            deadline,
+            fail_threshold,
+            every_minutes,
+            prefix,
+            attempt,
+            total_attempts,
+            tzname,
+        )
 
     except Exception as e:
         logger.error(f"[{name}] meeting error: {e}")
         try:
             if page is not None and await is_joined_to_meeting(page):
                 logger.warning(f"[{name}] join failed with timeout/error, but meeting UI is visible; continuing.")
-                return True
+                return await _hold_meeting_until_deadline(
+                    page,
+                    name,
+                    hc_cfg,
+                    global_cfg,
+                    logger,
+                    stop_event,
+                    deadline,
+                    fail_threshold,
+                    every_minutes,
+                    prefix,
+                    attempt,
+                    total_attempts,
+                    tzname,
+                )
         except Exception:
             pass
         if page is not None:
@@ -273,7 +332,7 @@ async def _run_meeting_attempt(
         except Exception:
             pass
 
-    return True if ever_healthy else False
+    return False
 
 
 def _parse_cfg_date(value):
