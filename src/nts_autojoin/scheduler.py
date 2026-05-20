@@ -214,10 +214,12 @@ async def _run_meeting_attempt(
             context_kwargs["viewport"] = None
         context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
+        navigation_timeout_ms = int(chromium_cfg.get("navigation_timeout_ms", 120000) or 120000)
+        page.set_default_navigation_timeout(navigation_timeout_ms)
         set_page(name, page)
 
         join_timeouts = global_cfg.get("join_timeouts", {}) or {}
-        page_goto_ms = int(join_timeouts.get("page_goto_ms", 120000))
+        page_goto_ms = int(join_timeouts.get("page_goto_ms", navigation_timeout_ms))
 
         await page.goto(url, wait_until="domcontentloaded", timeout=page_goto_ms)
         logger.info(f"[{name}] opening landing page: {page.url}")

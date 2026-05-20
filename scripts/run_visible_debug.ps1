@@ -18,4 +18,9 @@ if (Test-Path ".\venv\Scripts\python.exe") {
 }
 
 Write-Host "Starting bot in visible debug mode. Keep this window open."
+Write-Host ""
+Write-Host "To verify the bot browser executable from another PowerShell window, run:"
+Write-Host 'Get-CimInstance Win32_Process -Filter "name = ''chrome.exe''" | Select-Object ProcessId, ExecutablePath, CommandLine | Format-List'
+Write-Host "The bot browser should be under AppData\Local\ms-playwright\chromium-...\chrome-win\chrome.exe."
+Write-Host ""
 & $python -m nts_autojoin.service_main

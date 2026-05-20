@@ -17,12 +17,14 @@ system:
   require_ac_power: true
   keep_awake: true
 chromium:
-  headless: false
   visible_debug: true
+  headless: false
+  executable_path: null
+  channel: null
   slow_mo_ms: 100
-  window_width: 1400
-  window_height: 900
-  executable_path: C:\Program Files\Google\Chrome\Application\chrome.exe
+  viewport_width: 1400
+  viewport_height: 900
+  navigation_timeout_ms: 120000
   use_fake_media: true
   extra_args:
   - --use-fake-device-for-media-stream
