@@ -131,7 +131,10 @@ async def _run_meeting_attempt(
 
     try:
         pw, browser = await create_browser(chromium_cfg)
-        context = await browser.new_context()
+        context_kwargs = {}
+        if chromium_cfg.get("visible_debug"):
+            context_kwargs["viewport"] = None
+        context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
         set_page(name, page)
 

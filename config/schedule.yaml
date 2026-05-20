@@ -18,6 +18,10 @@ system:
   keep_awake: true
 chromium:
   headless: false
+  visible_debug: true
+  slow_mo_ms: 100
+  window_width: 1400
+  window_height: 900
   executable_path: C:\Program Files\Google\Chrome\Application\chrome.exe
   use_fake_media: true
   extra_args:
