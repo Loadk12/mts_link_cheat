@@ -1,6 +1,7 @@
 # src/nts_autojoin/scheduler.py
 import asyncio
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
@@ -67,15 +68,17 @@ def _remaining_seconds(deadline: datetime, tzname: str) -> float:
 
 async def _finish_if_deadline_reached(
     name: str,
-    deadline: datetime,
+    run: "_Run",
     tzname: str,
     global_cfg: dict,
     logger,
 ) -> bool:
     now = _now(tzname)
+    deadline = run.deadline
     remaining = (deadline - now).total_seconds()
     if remaining > 0:
         return False
+    run.leaving = True
 
     drift = max(0.0, -remaining)
     logger.info(
@@ -93,38 +96,82 @@ def _ensure_logs_dir():
     get_logs_dir().mkdir(parents=True, exist_ok=True)
 
 
-# Активные встречи: name -> (stop_event, started_at)
-_active_runs: dict[str, Tuple[asyncio.Event, datetime]] = {}
-# Ссылки активных встреч: name -> url (чтобы не заходить в одну встречу дважды)
-_active_urls: dict[str, str] = {}
+@dataclass(eq=False)
+class _Run:
+    """Активная встреча. deadline можно продлить, пока встреча не начала выход."""
+
+    name: str
+    url: str
+    deadline: datetime
+    started_at: datetime
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    # True, как только встреча решила выходить (дедлайн/стоп/все попытки).
+    # Такую встречу уже нельзя продлить — следующую надо запускать заново.
+    leaving: bool = False
+
+    @property
+    def accepting_extension(self) -> bool:
+        return not self.leaving and not self.stop_event.is_set() and not self.done.is_set()
+
+
+# Все активные встречи (имена могут совпадать, поэтому список, а не dict)
+_active_runs: List[_Run] = []
+
+# Сколько ждать, пока завершающаяся встреча с той же ссылкой закроет браузер
+_PREV_RUN_CLEANUP_WAIT_S = 180
 
 
 def active_meetings() -> List[str]:
-    return list(_active_runs.keys())
+    return [run.name for run in _active_runs]
 
 
 def _normalize_url(url: str | None) -> str:
     return (url or "").strip().rstrip("/").lower()
 
 
-def _active_run_for_url(url: str | None) -> str | None:
+def _find_run_for_url(url: str | None) -> "_Run | None":
     key = _normalize_url(url)
     if not key:
         return None
-    for name, active_url in _active_urls.items():
-        if _normalize_url(active_url) == key:
-            return name
+    # Сначала живая встреча, потом завершающаяся.
+    matches = [run for run in _active_runs if _normalize_url(run.url) == key]
+    for run in matches:
+        if run.accepting_extension:
+            return run
+    return matches[0] if matches else None
+
+
+def _active_run_for_url(url: str | None) -> str | None:
+    """Имя живой (не завершающейся) встречи с этой ссылкой."""
+    run = _find_run_for_url(url)
+    if run and run.accepting_extension:
+        return run.name
     return None
+
+
+def extend_active_run(url: str | None, new_deadline: datetime) -> "_Run | None":
+    """
+    Если по ссылке уже сидим и встреча ещё не выходит — продлеваем её дедлайн
+    до new_deadline (если он позже) и возвращаем её. Иначе None.
+    """
+    run = _find_run_for_url(url)
+    if not run or not run.accepting_extension:
+        return None
+    if new_deadline > run.deadline:
+        run.deadline = new_deadline
+    return run
 
 
 def request_stop_active() -> List[str]:
     """Запросить остановку всех текущих встреч. Возвращает их имена."""
 
     names = []
-    for name, (ev, _started) in list(_active_runs.items()):
-        if not ev.is_set():
-            ev.set()
-            names.append(name)
+    for run in list(_active_runs):
+        if not run.stop_event.is_set():
+            run.leaving = True
+            run.stop_event.set()
+            names.append(run.name)
     return names
 
 
@@ -199,7 +246,7 @@ async def _hold_meeting_until_deadline(
     global_cfg: dict,
     logger,
     stop_event: asyncio.Event,
-    deadline: datetime,
+    run: "_Run",
     fail_threshold: int,
     every_minutes: int,
     prefix: str,
@@ -215,7 +262,7 @@ async def _hold_meeting_until_deadline(
         "[%s] meeting joined at=%s deadline=%s",
         name,
         _fmt_clock(joined_at, tzname),
-        _fmt_clock(deadline, tzname),
+        _fmt_clock(run.deadline, tzname),
     )
     logger.info("[%s] healthcheck interval=%ss", name, healthcheck_interval)
 
@@ -224,10 +271,10 @@ async def _hold_meeting_until_deadline(
             await notify(global_cfg, f"⏹️ [{name}] остановлен вручную.")
             return True
 
-        if await _finish_if_deadline_reached(name, deadline, tzname, global_cfg, logger):
+        if await _finish_if_deadline_reached(name, run, tzname, global_cfg, logger):
             return True
 
-        remaining_before_check = max(0.0, _remaining_seconds(deadline, tzname))
+        remaining_before_check = max(0.0, _remaining_seconds(run.deadline, tzname))
         try:
             ok = await page_is_healthy(page, hc_cfg)
         except Exception as e:
@@ -270,10 +317,10 @@ async def _hold_meeting_until_deadline(
                     )
                     return False
 
-        if await _finish_if_deadline_reached(name, deadline, tzname, global_cfg, logger):
+        if await _finish_if_deadline_reached(name, run, tzname, global_cfg, logger):
             return True
 
-        remaining = max(0.0, _remaining_seconds(deadline, tzname))
+        remaining = max(0.0, _remaining_seconds(run.deadline, tzname))
         timeout = min(healthcheck_interval, remaining)
         logger.info(
             "[%s] holding meeting remaining=%.1fs healthcheck interval=%ss sleep_for=%.1fs",
@@ -301,7 +348,7 @@ async def _run_meeting_attempt(
     global_cfg: dict,
     logger,
     stop_event: asyncio.Event,
-    deadline: datetime,
+    run: "_Run",
     fail_threshold: int,
     every_minutes: int,
     prefix: str,
@@ -440,7 +487,7 @@ async def _run_meeting_attempt(
             global_cfg,
             logger,
             stop_event,
-            deadline,
+            run,
             fail_threshold,
             every_minutes,
             prefix,
@@ -465,7 +512,7 @@ async def _run_meeting_attempt(
                     global_cfg,
                     logger,
                     stop_event,
-                    deadline,
+                    run,
                     fail_threshold,
                     every_minutes,
                     prefix,
@@ -639,30 +686,57 @@ async def run_meeting(
         )
         return
 
-    if name in _active_runs:
-        logger.info("[%s] already running; duplicate start skipped", name)
-        return
-    same_url_run = _active_run_for_url(url)
-    if same_url_run:
-        logger.info("[%s] url already joined by [%s]; duplicate start skipped", name, same_url_run)
-        await notify(
-            global_cfg,
-            f"ℹ️ [{name}] уже подключён к этой встрече как [{same_url_run}]. "
-            f"Для перезахода сначала /disconnect.",
-        )
-        return
-
     fail_threshold = int(hc_cfg.get("fail_threshold", 2))
     every_minutes = int(hc_cfg.get("every_minutes", 5))
 
     prefix = _sanitize(name)
     deadline = _resolve_deadline(meeting, tzname)
+
+    # Уже сидим по этой ссылке (например, сдвоенная пара или /connect):
+    # продлеваем живую встречу вместо второго браузера.
+    existing = extend_active_run(url, deadline)
+    if existing is not None:
+        logger.info(
+            "[%s] url already joined by [%s]; deadline now %s",
+            name,
+            existing.name,
+            _fmt_clock(existing.deadline, tzname),
+        )
+        try:
+            await notify(
+                global_cfg,
+                f"ℹ️ [{name}] уже сижу в этой встрече как [{existing.name}], "
+                f"выйду в {_fmt_clock(existing.deadline, tzname)[:5]}.",
+            )
+        except Exception:
+            pass
+        return
+
+    # Встреча с той же ссылкой как раз выходит (дедлайн прошёл / /disconnect):
+    # дожидаемся, пока она закроет браузер, и заходим заново.
+    leaving_run = _find_run_for_url(url)
+    if leaving_run is not None:
+        logger.info(
+            "[%s] previous run [%s] on same url is leaving; waiting for cleanup",
+            name,
+            leaving_run.name,
+        )
+        try:
+            await asyncio.wait_for(leaving_run.done.wait(), timeout=_PREV_RUN_CLEANUP_WAIT_S)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] previous run cleanup timed out; starting anyway", name)
+        # Пока ждали, мог стартовать кто-то ещё — тогда продлеваем его.
+        existing = extend_active_run(url, deadline)
+        if existing is not None:
+            logger.info("[%s] another run [%s] took over while waiting", name, existing.name)
+            return
+
     logger.info(f"[{name}] meeting deadline={_fmt_clock(deadline, tzname)}")
 
-    # Регистрируемся до первого await, чтобы параллельный старт увидел дубль.
-    stop_event = asyncio.Event()
-    _active_runs[name] = (stop_event, _now(tzname))
-    _active_urls[name] = url
+    # Регистрируемся до первого await, чтобы параллельный старт увидел нас.
+    run = _Run(name=name, url=url, deadline=deadline, started_at=_now(tzname))
+    _active_runs.append(run)
+    stop_event = run.stop_event
 
     try:
         await notify(global_cfg, f"▶️ [{name}] старт.")
@@ -677,12 +751,12 @@ async def run_meeting(
         for attempt, delay in enumerate(retry_delays, start=1):
             if stop_event.is_set():
                 break
-            if _now(tzname) >= deadline:
+            if _now(tzname) >= run.deadline:
                 logger.info(f"[{name}] meeting deadline reached; retry cancelled")
                 break
 
             if delay:
-                remaining = _remaining_seconds(deadline, tzname)
+                remaining = _remaining_seconds(run.deadline, tzname)
                 if remaining <= 0:
                     logger.info(f"[{name}] meeting deadline reached; retry cancelled")
                     break
@@ -709,7 +783,7 @@ async def run_meeting(
                     pass
                 if stop_event.is_set():
                     break
-                if _now(tzname) >= deadline:
+                if _now(tzname) >= run.deadline:
                     logger.info(f"[{name}] meeting deadline reached; retry cancelled")
                     break
 
@@ -723,7 +797,7 @@ async def run_meeting(
                 global_cfg,
                 logger,
                 stop_event,
-                deadline,
+                run,
                 fail_threshold,
                 every_minutes,
                 attempt_prefix,
@@ -735,16 +809,20 @@ async def run_meeting(
                 success = True
                 break
 
-        if not success and not stop_event.is_set() and _now(tzname) >= deadline:
-            await _finish_if_deadline_reached(name, deadline, tzname, global_cfg, logger)
+        if not success and not stop_event.is_set() and _now(tzname) >= run.deadline:
+            await _finish_if_deadline_reached(name, run, tzname, global_cfg, logger)
         elif not success and not stop_event.is_set():
             try:
                 await notify(global_cfg, f"⛔ [{name}] все попытки подключения исчерпаны.")
             except Exception:
                 pass
     finally:
-        _active_runs.pop(name, None)
-        _active_urls.pop(name, None)
+        run.leaving = True
+        try:
+            _active_runs.remove(run)
+        except ValueError:
+            pass
+        run.done.set()
         try:
             clear_page(name)
         except Exception:
@@ -852,7 +930,8 @@ def catch_up_running_meetings(cfg: dict, logger) -> List[str]:
     started: List[str] = []
     for m, start, end in find_running_meetings(cfg):
         name = m.get("name", "Безымянка")
-        if name in _active_runs or _active_run_for_url(m.get("url")):
+        current = _find_run_for_url(m.get("url"))
+        if current is not None and current.accepting_extension and current.deadline >= end:
             continue
         logger.info(
             "[%s] catch-up: meeting started at %s, joining late until %s",

@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Tuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from dateutil import tz
 
 from .settings import get_logs_dir, load_config
@@ -16,8 +17,8 @@ from .logging_setup import setup_logger
 from .power import keep_awake, on_ac_power
 from .notifier import notify
 from .scheduler import (
-    _active_run_for_url,
     _keep_task,
+    extend_active_run,
     _meeting_active_on,
     catch_up_running_meetings,
     schedule_jobs,
@@ -55,6 +56,26 @@ _MODE_SUFFIX = {
     "offline": " · очно",
     "online_manual": " · вручную",
 }
+
+
+def _first_class_today(cfg: Dict[str, Any], now: datetime) -> datetime | None:
+    """Время начала первой пары сегодня (любой режим, с учётом диапазона дат)."""
+    tzinfo = now.tzinfo
+    first: datetime | None = None
+    for m in cfg.get("meetings", []) or []:
+        if not isinstance(m, dict) or not m.get("cron"):
+            continue
+        if not _meeting_active_on(m, now.date()):
+            continue
+        try:
+            trigger = CronTrigger.from_crontab(m["cron"], timezone=tzinfo)
+            start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            nxt = trigger.get_next_fire_time(None, start_of_day)
+        except Exception:
+            continue
+        if nxt and nxt.date() == now.date() and (first is None or nxt < first):
+            first = nxt
+    return first
 
 
 def _today_digest_lines(cfg: Dict[str, Any], from_start_of_day: bool) -> List[str]:
@@ -124,6 +145,10 @@ async def main():
             logger.info("catch-up started: %s", started)
 
     def _schedule_service_jobs() -> None:
+        _schedule_daily_summary()
+        _schedule_pre_class_pull()
+
+    def _schedule_daily_summary() -> None:
         ncfg = cfg.get("notify") or {}
         if not ncfg.get("daily_summary"):
             return
@@ -140,6 +165,77 @@ async def main():
             replace_existing=True,
         )
 
+    def _pre_class_pull_minutes() -> int:
+        dmami_cfg = cfg.get("dmami") or {}
+        if not dmami_cfg.get("enabled", True):
+            return 0
+        try:
+            return int(dmami_cfg.get("pull_before_first_class_minutes", 30) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _schedule_pre_class_pull() -> None:
+        """
+        Каждый день за N минут до первой пары дёргаем DMAMI, чтобы подтянуть
+        свежие ссылки. Планировщик дня срабатывает в 00:05 и при каждом
+        перепланировании; сам pull — разовая задача на сегодня.
+        """
+        if _pre_class_pull_minutes() <= 0:
+            return
+        scheduler.add_job(
+            _plan_pre_class_pull,
+            trigger=CronTrigger(hour=0, minute=5, timezone=tzinfo),
+            id="dmami_pull_planner",
+            name="dmami_pull_planner",
+            coalesce=True,
+            misfire_grace_time=3600,
+            max_instances=1,
+            replace_existing=True,
+        )
+        _plan_pre_class_pull()
+
+    def _plan_pre_class_pull() -> None:
+        minutes = _pre_class_pull_minutes()
+        if minutes <= 0:
+            return
+        now = datetime.now(tzinfo)
+        first = _first_class_today(cfg, now)
+        if first is None:
+            logger.info("pre-class pull: no classes today")
+            return
+        run_at = first - timedelta(minutes=minutes)
+        if run_at <= now:
+            logger.info(
+                "pre-class pull: first class at %s, pull time %s already passed",
+                first.strftime("%H:%M"),
+                run_at.strftime("%H:%M"),
+            )
+            return
+        scheduler.add_job(
+            _pre_class_pull,
+            trigger=DateTrigger(run_date=run_at, timezone=tzinfo),
+            id="dmami_pre_class_pull",
+            name="dmami_pre_class_pull",
+            misfire_grace_time=600,
+            replace_existing=True,
+        )
+        logger.info(
+            "pre-class pull planned at %s (first class %s)",
+            run_at.strftime("%H:%M"),
+            first.strftime("%H:%M"),
+        )
+
+    async def _pre_class_pull():
+        logger.info("pre-class DMAMI pull started")
+        try:
+            updated = await _dmami_pull_job(notify_result=False, return_count=True)
+        except Exception:
+            return  # ошибка уже залогирована и отправлена в _dmami_pull_job
+        await notify(
+            cfg,
+            f"🔄 Авто-/pull перед первой парой: обновлено ссылок — {updated}.",
+        )
+
     async def _daily_summary():
         try:
             now = datetime.now(tzinfo)
@@ -151,15 +247,19 @@ async def main():
         except Exception as e:
             logger.warning(f"daily_summary error: {e}")
 
-    async def _dmami_pull_job(notify_result: bool = False):
+    pull_lock = asyncio.Lock()
+
+    async def _dmami_pull_job(notify_result: bool = False, return_count: bool = False):
         try:
-            updated, _changes = await scrape_and_update(cfg, logger)
-            # перечитать конфиг и перепланировать
-            _reschedule(load_config())
+            # /pull и авто-pull не должны скрейпить и переписывать конфиг одновременно
+            async with pull_lock:
+                updated, _changes = await scrape_and_update(cfg, logger)
+                # перечитать конфиг и перепланировать
+                _reschedule(load_config())
             report = _changes[0] if _changes else f"DMAMI sync завершён. Updated URLs: {updated}."
             if notify_result:
                 await notify(cfg, report)
-            return report
+            return updated if return_count else report
         except Exception as e:
             logger.error(f"DMAMI автопул ошибка: {e}")
             try:
@@ -287,10 +387,11 @@ async def main():
         chromium_cfg = cfg.get("chromium", {}) or {}
         hc_cfg = cfg.get("healthcheck", {}) or {}
 
-        busy_with = _active_run_for_url(url)
-        if busy_with:
+        current = extend_active_run(url, end)
+        if current is not None:
             return (
-                f"ℹ️ Уже сижу в этой встрече: [{busy_with}].\n"
+                f"ℹ️ Уже сижу в этой встрече: [{current.name}].\n"
+                f"Выйду в {current.deadline.strftime('%H:%M')}. "
                 f"Для перезахода сначала /disconnect."
             )
 

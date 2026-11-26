@@ -4,6 +4,8 @@ dmami:
   enabled: true
   auto_generate_schedule: true
   auto_generate_on_start: false
+  # Авто-/pull за N минут до первой пары дня (0 — выключить)
+  pull_before_first_class_minutes: 30
   lookahead_weeks: 8
   scan_weeks: 8
 notify:

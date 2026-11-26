@@ -282,15 +282,61 @@ async def wait_post_join_transition(
     return False
 
 
+class _ShortcutToDevicePrejoin(Exception):
+    """Страница уже на экране выбора устройств: шаги лендинга не нужны."""
+
+
+async def _is_device_prejoin(page) -> bool:
+    state_info = await detect_join_state(page)
+    return state_info.get("state") == "device_prejoin"
+
+
+async def _wait_selector_or_shortcut(page, selector: str, timeout_ms: int, poll_ms: int = 500):
+    """
+    Ждём селектор, но параллельно следим за состоянием страницы. Если МТС Линк
+    пропустил лендинг (имя запомнено в профиле) и сразу показал проверку
+    камеры/микрофона, бросаем _ShortcutToDevicePrejoin вместо таймаута.
+    Возвращает True, если вошли в встречу, пока ждали.
+    """
+    deadline = time.monotonic() * 1000 + timeout_ms
+    while True:
+        try:
+            if await page.locator(selector).first.is_visible():
+                return False
+        except Exception:
+            pass
+        if await is_joined_to_meeting(page):
+            return True
+        if await _is_device_prejoin(page):
+            raise _ShortcutToDevicePrejoin()
+        if time.monotonic() * 1000 >= deadline:
+            raise TimeoutError(f"selector {selector!r} not visible after {timeout_ms}ms")
+        await page.wait_for_timeout(poll_ms)
+
+
 async def perform_join(page, join_cfg: Dict[str, Any], logger=None, timeouts: Dict[str, Any] | None = None):
     """
     Execute configured join steps. If the webinar UI is detected at any point,
     stop immediately and report success instead of waiting for pre-join controls.
+    If the device-check screen shows up instead of the landing form, skip the
+    remaining landing steps and click the final join button.
     """
     _log(logger, "opening landing page / starting join flow")
     join_timeouts = _timeouts(join_cfg, timeouts)
+    try:
+        return await _perform_join_steps(page, join_cfg, join_timeouts, logger)
+    except _ShortcutToDevicePrejoin:
+        _log(logger, "device prejoin screen shown instead of landing; skipping landing steps")
+        if await wait_post_join_transition(page, join_timeouts, logger=logger):
+            return True
+        return await is_joined_to_meeting(page)
+
+
+async def _perform_join_steps(page, join_cfg: Dict[str, Any], join_timeouts: Dict[str, int], logger):
     if await _finish_if_joined(page, logger, "initial page"):
         return True
+    if await _is_device_prejoin(page):
+        raise _ShortcutToDevicePrejoin()
 
     steps = join_cfg.get("steps", [])
     for step in steps:
@@ -310,7 +356,9 @@ async def perform_join(page, join_cfg: Dict[str, Any], logger=None, timeouts: Di
         if action == "wait":
             selector = step["selector"]
             _log(logger, f"waiting for selector: {selector}")
-            await page.wait_for_selector(selector, timeout=timeout_ms)
+            if await _wait_selector_or_shortcut(page, selector, timeout_ms):
+                _log(logger, f"detected in-meeting UI while waiting {selector}; join success")
+                return True
 
         elif action == "wait_any":
             selectors: List[str] = step.get("selectors", [])
@@ -323,6 +371,8 @@ async def perform_join(page, join_cfg: Dict[str, Any], logger=None, timeouts: Di
             while elapsed < timeout_ms and not found:
                 if await _finish_if_joined(page, logger, "wait_any polling"):
                     return True
+                if await _is_device_prejoin(page):
+                    raise _ShortcutToDevicePrejoin()
                 for sel in selectors:
                     try:
                         loc = page.locator(sel)
@@ -341,7 +391,8 @@ async def perform_join(page, join_cfg: Dict[str, Any], logger=None, timeouts: Di
         elif action == "click":
             selector = step["selector"]
             _log(logger, f"clicking join/control selector: {selector}")
-            await page.wait_for_selector(selector, timeout=timeout_ms)
+            if await _wait_selector_or_shortcut(page, selector, timeout_ms):
+                return True
             await page.click(selector)
             if _looks_like_join_selector(selector):
                 _log(logger, "clicked join button")
@@ -367,7 +418,8 @@ async def perform_join(page, join_cfg: Dict[str, Any], logger=None, timeouts: Di
             selector = step["selector"]
             value = step.get("value", "")
             _log(logger, f"filling field: {selector}")
-            await page.wait_for_selector(selector, timeout=timeout_ms)
+            if await _wait_selector_or_shortcut(page, selector, timeout_ms):
+                return True
             await page.fill(selector, value)
 
         elif action == "maybe_fill":
@@ -384,7 +436,8 @@ async def perform_join(page, join_cfg: Dict[str, Any], logger=None, timeouts: Di
             selector = step["selector"]
             value = step.get("value", "")
             _log(logger, f"pressing {value} in {selector}")
-            await page.wait_for_selector(selector, timeout=timeout_ms)
+            if await _wait_selector_or_shortcut(page, selector, timeout_ms):
+                return True
             await page.press(selector, value)
 
         elif action == "maybe_press":
