@@ -1,6 +1,7 @@
 venv/
 logs/
 browsers/
+runtime/
 __pycache__/
 *.py[cod]
 *.egg-info/

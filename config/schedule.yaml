@@ -67,7 +67,7 @@ default_join:
     selector: '#name'
   - action: fill
     selector: '#name'
-    value: Лухнев Олег 231-363
+    value: 231-363 Лухнев Олег
   - action: press
     selector: '#name'
     value: Tab

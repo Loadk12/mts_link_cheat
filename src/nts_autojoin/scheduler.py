@@ -3,18 +3,26 @@ import asyncio
 import re
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from dateutil import tz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from .browser import create_browser
+from .browser import create_browser_context, release_browser_profile
+from .cron_helpers import prev_fire_time
 from .join_flow import perform_join, ensure_media_disabled
 from .healthcheck import is_joined_to_meeting, page_is_healthy
 from .live import set_page, clear_page
 from .notifier import notify, send_photo
+from .providers import YANDEX_TELEMOST, detect_provider
 from .settings import get_logs_dir
+from .yandex_telemost import (
+    assert_real_telemost_joined,
+    detect_telemost_state,
+    perform_telemost_prejoin,
+    save_telemost_diagnostics,
+)
 
 
 def _tz(tzname: str):
@@ -29,16 +37,84 @@ def _now(tzname: str) -> datetime:
     return datetime.now(_tz(tzname))
 
 
+def _ensure_tz(dt: datetime, tzname: str) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_tz(tzname))
+    return dt.astimezone(_tz(tzname))
+
+
+def _resolve_deadline(meeting: Dict[str, Any], tzname: str) -> datetime:
+    raw_deadline = meeting.get("deadline_at")
+    if isinstance(raw_deadline, datetime):
+        return _ensure_tz(raw_deadline, tzname)
+    if raw_deadline:
+        try:
+            return _ensure_tz(datetime.fromisoformat(str(raw_deadline)), tzname)
+        except Exception:
+            pass
+
+    duration_min = int(meeting.get("duration_minutes", 45))
+    return _now(tzname) + timedelta(minutes=duration_min)
+
+
+def _fmt_clock(dt: datetime, tzname: str) -> str:
+    return _ensure_tz(dt, tzname).strftime("%H:%M:%S")
+
+
+def _remaining_seconds(deadline: datetime, tzname: str) -> float:
+    return (deadline - _now(tzname)).total_seconds()
+
+
+async def _finish_if_deadline_reached(
+    name: str,
+    deadline: datetime,
+    tzname: str,
+    global_cfg: dict,
+    logger,
+) -> bool:
+    now = _now(tzname)
+    remaining = (deadline - now).total_seconds()
+    if remaining > 0:
+        return False
+
+    drift = max(0.0, -remaining)
+    logger.info(
+        "[%s] deadline reached at=%s actual leave started at=%s deadline drift=%.1fs",
+        name,
+        _fmt_clock(deadline, tzname),
+        _fmt_clock(now, tzname),
+        drift,
+    )
+    await notify(global_cfg, f"⏹️ [{name}] время вышло, выхожу.")
+    return True
+
+
 def _ensure_logs_dir():
     get_logs_dir().mkdir(parents=True, exist_ok=True)
 
 
 # Активные встречи: name -> (stop_event, started_at)
 _active_runs: dict[str, Tuple[asyncio.Event, datetime]] = {}
+# Ссылки активных встреч: name -> url (чтобы не заходить в одну встречу дважды)
+_active_urls: dict[str, str] = {}
 
 
 def active_meetings() -> List[str]:
     return list(_active_runs.keys())
+
+
+def _normalize_url(url: str | None) -> str:
+    return (url or "").strip().rstrip("/").lower()
+
+
+def _active_run_for_url(url: str | None) -> str | None:
+    key = _normalize_url(url)
+    if not key:
+        return None
+    for name, active_url in _active_urls.items():
+        if _normalize_url(active_url) == key:
+            return name
+    return None
 
 
 def request_stop_active() -> List[str]:
@@ -133,22 +209,37 @@ async def _hold_meeting_until_deadline(
 ) -> bool:
     consecutive_failures = 0
     ever_healthy = False
+    healthcheck_interval = max(30, every_minutes * 60)
+    joined_at = _now(tzname)
+    logger.info(
+        "[%s] meeting joined at=%s deadline=%s",
+        name,
+        _fmt_clock(joined_at, tzname),
+        _fmt_clock(deadline, tzname),
+    )
+    logger.info("[%s] healthcheck interval=%ss", name, healthcheck_interval)
 
     while True:
         if stop_event.is_set():
             await notify(global_cfg, f"⏹️ [{name}] остановлен вручную.")
             return True
 
-        now = _now(tzname)
-        if now >= deadline:
-            await notify(global_cfg, f"⏹️ [{name}] время вышло, выхожу.")
+        if await _finish_if_deadline_reached(name, deadline, tzname, global_cfg, logger):
             return True
 
+        remaining_before_check = max(0.0, _remaining_seconds(deadline, tzname))
         try:
             ok = await page_is_healthy(page, hc_cfg)
         except Exception as e:
             logger.warning(f"[{name}] healthcheck error: {e}")
             ok = False
+        logger.info(
+            "[%s] holding meeting remaining=%.1fs healthcheck interval=%ss ok=%s",
+            name,
+            remaining_before_check,
+            healthcheck_interval,
+            ok,
+        )
 
         if ok:
             ever_healthy = True
@@ -179,9 +270,20 @@ async def _hold_meeting_until_deadline(
                     )
                     return False
 
-        sleep_for = max(30, every_minutes * 60)
-        remaining = max(0, (deadline - _now(tzname)).total_seconds())
-        timeout = min(sleep_for, remaining) if remaining else sleep_for
+        if await _finish_if_deadline_reached(name, deadline, tzname, global_cfg, logger):
+            return True
+
+        remaining = max(0.0, _remaining_seconds(deadline, tzname))
+        timeout = min(healthcheck_interval, remaining)
+        logger.info(
+            "[%s] holding meeting remaining=%.1fs healthcheck interval=%ss sleep_for=%.1fs",
+            name,
+            remaining,
+            healthcheck_interval,
+            timeout,
+        )
+        if timeout <= 0:
+            continue
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -209,13 +311,19 @@ async def _run_meeting_attempt(
 ):
     pw = browser = context = page = None
     success_shot_task = None
+    provider = detect_provider(url)
 
     try:
-        pw, browser = await create_browser(chromium_cfg)
-        context_kwargs = {}
-        if chromium_cfg.get("visible_debug"):
-            context_kwargs["viewport"] = None
-        context = await browser.new_context(**context_kwargs)
+        logger.info(f"[{name}] provider detected: {provider}")
+        pw, browser, context = await create_browser_context(chromium_cfg)
+        if provider == YANDEX_TELEMOST:
+            try:
+                await context.grant_permissions(
+                    ["microphone", "camera"],
+                    origin="https://telemost.yandex.ru",
+                )
+            except Exception as e:
+                logger.warning(f"telemost: media permission grant skipped: {e}")
         page = await context.new_page()
         navigation_timeout_ms = int(chromium_cfg.get("navigation_timeout_ms", 120000) or 120000)
         page.set_default_navigation_timeout(navigation_timeout_ms)
@@ -224,17 +332,77 @@ async def _run_meeting_attempt(
         join_timeouts = global_cfg.get("join_timeouts", {}) or {}
         page_goto_ms = int(join_timeouts.get("page_goto_ms", navigation_timeout_ms))
 
+        if provider == YANDEX_TELEMOST:
+            logger.info("telemost: opening URL")
         await page.goto(url, wait_until="domcontentloaded", timeout=page_goto_ms)
         logger.info(f"[{name}] opening landing page: {page.url}")
         already_joined = False
         try:
-            already_joined = await is_joined_to_meeting(page)
+            if provider == YANDEX_TELEMOST:
+                already_joined = await assert_real_telemost_joined(page, logger, log_failures=False)
+            else:
+                already_joined = await is_joined_to_meeting(page)
             if already_joined:
                 logger.info(f"[{name}] detected in-meeting UI before join; skipping join steps.")
         except Exception as e:
             logger.warning(f"[{name}] pre-join meeting detection failed: {e}")
 
-        if join_cfg and not already_joined:
+        if not already_joined and provider == YANDEX_TELEMOST:
+            try:
+                joined = await perform_telemost_prejoin(
+                    page,
+                    join_cfg,
+                    logger=logger,
+                    timeouts=join_timeouts,
+                )
+                if joined:
+                    if not await assert_real_telemost_joined(page, logger):
+                        await save_telemost_diagnostics(page, "joined_sanity_failed", logger)
+                        raise TimeoutError("Telemost reported joined, but sanity check still sees prejoin/loading")
+                    logger.info(f"[{name}] join success.")
+                elif await assert_real_telemost_joined(page, logger):
+                    logger.warning(f"[{name}] Telemost prejoin returned false, but meeting UI is visible; continuing.")
+                else:
+                    raise TimeoutError("Telemost prejoin finished without detecting meeting UI")
+            except Exception as e:
+                if await assert_real_telemost_joined(page, logger):
+                    logger.warning(f"[{name}] Telemost prejoin timeout/error but already inside meeting; continuing: {e}")
+                else:
+                    try:
+                        state_info = await detect_telemost_state(page)
+                        if state_info.get("state") in {
+                            "update_modal",
+                            "discovery_modal",
+                            "profile_modal",
+                            "call_landing",
+                            "media_error_video",
+                            "media_error_microphone",
+                            "prejoin",
+                        }:
+                            logger.warning(
+                                f"[{name}] Telemost still before joined state ({state_info.get('state')}); retrying current page before new browser."
+                            )
+                            joined = await perform_telemost_prejoin(
+                                page,
+                                join_cfg,
+                                logger=logger,
+                                timeouts=join_timeouts,
+                            )
+                            if joined:
+                                if not await assert_real_telemost_joined(page, logger):
+                                    await save_telemost_diagnostics(page, "joined_sanity_failed_after_retry", logger)
+                                    raise TimeoutError(
+                                        "Telemost retry reported joined, but sanity check still sees prejoin/loading"
+                                    )
+                                logger.info(f"[{name}] join success.")
+                            else:
+                                raise TimeoutError("Telemost prejoin retry returned false")
+                        else:
+                            raise
+                    except Exception:
+                        logger.warning(f"[{name}] Telemost prejoin failed: {e}")
+                        raise
+        elif join_cfg and not already_joined:
             try:
                 joined = await perform_join(page, join_cfg, logger=logger, timeouts=join_timeouts)
                 if joined:
@@ -250,7 +418,14 @@ async def _run_meeting_attempt(
                     logger.warning(f"[{name}] join failed: {e}")
                     raise
         try:
+            if provider == YANDEX_TELEMOST:
+                if not await assert_real_telemost_joined(page, logger):
+                    await save_telemost_diagnostics(page, "before_success_screenshot_not_joined", logger)
+                    raise TimeoutError("Telemost is not really joined before success screenshot")
+                logger.info("telemost: existing media-disable flow started")
             await ensure_media_disabled(page)
+            if provider == YANDEX_TELEMOST:
+                logger.info("telemost: join success")
         except Exception as e:
             logger.warning(f"[{name}] не удалось гарантировать выключение медиа: {e}")
 
@@ -277,7 +452,11 @@ async def _run_meeting_attempt(
     except Exception as e:
         logger.error(f"[{name}] meeting error: {e}")
         try:
-            if page is not None and await is_joined_to_meeting(page):
+            if page is not None and (
+                await assert_real_telemost_joined(page, logger)
+                if provider == YANDEX_TELEMOST
+                else await is_joined_to_meeting(page)
+            ):
                 logger.warning(f"[{name}] join failed with timeout/error, but meeting UI is visible; continuing.")
                 return await _hold_meeting_until_deadline(
                     page,
@@ -336,6 +515,7 @@ async def _run_meeting_attempt(
                 await pw.stop()
         except Exception:
             pass
+        release_browser_profile(context)
 
     return False
 
@@ -434,7 +614,6 @@ async def run_meeting(
             bool(url),
         )
         return
-    duration_min = int(meeting.get("duration_minutes", 45))
     join_cfg = meeting.get("join", {}) or {}
 
     # Опциональный фильтр по диапазону дат (start_date/end_date).
@@ -460,16 +639,35 @@ async def run_meeting(
         )
         return
 
+    if name in _active_runs:
+        logger.info("[%s] already running; duplicate start skipped", name)
+        return
+    same_url_run = _active_run_for_url(url)
+    if same_url_run:
+        logger.info("[%s] url already joined by [%s]; duplicate start skipped", name, same_url_run)
+        await notify(
+            global_cfg,
+            f"ℹ️ [{name}] уже подключён к этой встрече как [{same_url_run}]. "
+            f"Для перезахода сначала /disconnect.",
+        )
+        return
+
     fail_threshold = int(hc_cfg.get("fail_threshold", 2))
     every_minutes = int(hc_cfg.get("every_minutes", 5))
 
     prefix = _sanitize(name)
-    deadline = _now(tzname) + timedelta(minutes=duration_min)
+    deadline = _resolve_deadline(meeting, tzname)
+    logger.info(f"[{name}] meeting deadline={_fmt_clock(deadline, tzname)}")
 
-    await notify(global_cfg, f"▶️ [{name}] старт.")
-
+    # Регистрируемся до первого await, чтобы параллельный старт увидел дубль.
     stop_event = asyncio.Event()
     _active_runs[name] = (stop_event, _now(tzname))
+    _active_urls[name] = url
+
+    try:
+        await notify(global_cfg, f"▶️ [{name}] старт.")
+    except Exception:
+        pass
 
     retry_delays = [0, 60, 120, 300]
     total_attempts = len(retry_delays)
@@ -479,21 +677,40 @@ async def run_meeting(
         for attempt, delay in enumerate(retry_delays, start=1):
             if stop_event.is_set():
                 break
+            if _now(tzname) >= deadline:
+                logger.info(f"[{name}] meeting deadline reached; retry cancelled")
+                break
 
             if delay:
+                remaining = _remaining_seconds(deadline, tzname)
+                if remaining <= 0:
+                    logger.info(f"[{name}] meeting deadline reached; retry cancelled")
+                    break
+                retry_sleep = min(float(delay), max(0.0, remaining))
+                if retry_sleep < delay:
+                    logger.info(
+                        "[%s] retry sleep clipped by deadline: delay=%ss remaining=%.1fs sleep_for=%.1fs",
+                        name,
+                        delay,
+                        remaining,
+                        retry_sleep,
+                    )
                 try:
                     await notify(
                         global_cfg,
-                        f"🔁 [{name}] повторная попытка через {int(delay/60)} мин "
+                        f"🔁 [{name}] повторная попытка через {max(1, int(retry_sleep / 60))} мин "
                         f"({attempt}/{total_attempts}).",
                     )
                 except Exception:
                     pass
                 try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                    await asyncio.wait_for(stop_event.wait(), timeout=retry_sleep)
                 except asyncio.TimeoutError:
                     pass
                 if stop_event.is_set():
+                    break
+                if _now(tzname) >= deadline:
+                    logger.info(f"[{name}] meeting deadline reached; retry cancelled")
                     break
 
             attempt_prefix = f"{prefix}_try{attempt}"
@@ -518,16 +735,16 @@ async def run_meeting(
                 success = True
                 break
 
-        if not success and not stop_event.is_set():
+        if not success and not stop_event.is_set() and _now(tzname) >= deadline:
+            await _finish_if_deadline_reached(name, deadline, tzname, global_cfg, logger)
+        elif not success and not stop_event.is_set():
             try:
                 await notify(global_cfg, f"⛔ [{name}] все попытки подключения исчерпаны.")
             except Exception:
                 pass
     finally:
-        try:
-            _active_runs.pop(name, None)
-        except Exception:
-            pass
+        _active_runs.pop(name, None)
+        _active_urls.pop(name, None)
         try:
             clear_page(name)
         except Exception:
@@ -588,6 +805,80 @@ def schedule_jobs(scheduler: AsyncIOScheduler, cfg: dict, logger):
         logger.info(
             f"Запланировано: {m.get('name','(no name)')} @ {cron_expr} [{tzname}]"
         )
+
+
+def find_running_meetings(
+    cfg: dict,
+    now: datetime | None = None,
+    min_remaining_minutes: int = 5,
+) -> List[Tuple[Dict, datetime, datetime]]:
+    """
+    Встречи, которые по расписанию идут прямо сейчас: (meeting, start, end).
+    Учитывает диапазон дат и режим автоподключения.
+    """
+    tzname = cfg.get("timezone", "Europe/Moscow")
+    tzinfo = _tz(tzname)
+    now = now or datetime.now(tzinfo)
+    out: List[Tuple[Dict, datetime, datetime]] = []
+    for m in cfg.get("meetings", []) or []:
+        if not isinstance(m, dict) or not m.get("cron") or not _can_auto_join(m):
+            continue
+        try:
+            start = prev_fire_time(m["cron"], tzinfo, now)
+        except Exception:
+            continue
+        if not start:
+            continue
+        end = start + timedelta(minutes=int(m.get("duration_minutes", 45)))
+        if not (start <= now < end):
+            continue
+        if (end - now).total_seconds() < min_remaining_minutes * 60:
+            continue
+        if not _meeting_active_on(m, start.date()):
+            continue
+        out.append((m, start, end))
+    return out
+
+
+def catch_up_running_meetings(cfg: dict, logger) -> List[str]:
+    """
+    Запустить встречи, которые уже идут, но наш cron-запуск был пропущен
+    (рестарт сервиса, /reload, /pull посреди пары). Дедлайн — конец пары
+    по расписанию, а не «сейчас + длительность».
+    """
+    tzname = cfg.get("timezone", "Europe/Moscow")
+    chromium_cfg = cfg.get("chromium", {}) or {}
+    hc_cfg = cfg.get("healthcheck", {}) or {}
+    started: List[str] = []
+    for m, start, end in find_running_meetings(cfg):
+        name = m.get("name", "Безымянка")
+        if name in _active_runs or _active_run_for_url(m.get("url")):
+            continue
+        logger.info(
+            "[%s] catch-up: meeting started at %s, joining late until %s",
+            name,
+            _fmt_clock(start, tzname),
+            _fmt_clock(end, tzname),
+        )
+        meeting = dict(m)
+        meeting["deadline_at"] = end
+        _keep_task(
+            asyncio.create_task(
+                run_meeting(meeting, tzname, chromium_cfg, hc_cfg, cfg, logger)
+            )
+        )
+        started.append(name)
+    return started
+
+
+# Держим ссылки на фоновые задачи, иначе asyncio может их собрать GC.
+_background_tasks: set = set()
+
+
+def _keep_task(task: "asyncio.Task") -> "asyncio.Task":
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 def _shift_cron_minutes(cron_expr: str, delta_minutes: int) -> str | None:
