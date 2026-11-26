@@ -7,6 +7,9 @@ from .healthcheck import detect_join_state, is_joined_to_meeting
 
 DEFAULT_JOIN_TIMEOUTS = {
     "landing_ms": 120000,
+    "continue_browser_ms": 120000,
+    "prejoin_ms": 120000,
+    "name_ms": 60000,
     "name_input_ms": 120000,
     "join_button_ms": 120000,
     "post_join_grace_ms": 15000,
@@ -19,36 +22,49 @@ DEFAULT_JOIN_TIMEOUTS = {
 
 FINAL_JOIN_BUTTON_SELECTORS = [
     "button[data-testid*=\"join\" i]",
+    "button[data-testid=\"enter-conference-button\"]",
     "button[aria-label*=\"Присоединиться к встрече\" i]",
     "[role=\"button\"][aria-label*=\"Присоединиться к встрече\" i]",
     "button:has-text(\"Присоединиться к встрече\")",
     "button:has-text(\"ПРИСОЕДИНИТЬСЯ К ВСТРЕЧЕ\")",
+    "button:has-text(\"Подключиться\")",
     "[role=\"button\"]:has-text(\"Присоединиться к встрече\")",
     "[role=\"button\"]:has-text(\"ПРИСОЕДИНИТЬСЯ К ВСТРЕЧЕ\")",
+    "[role=\"button\"]:has-text(\"Подключиться\")",
 ]
 
 
 MIC_SELECTORS = [
     "button[data-testid*=\"Microphone\" i]",
+    "button[data-testid*=\"mic\" i]",
+    "button[data-testid*=\"mute-audio\" i]",
     "button[aria-label*=\"микроф\" i]",
     "button[label*=\"микроф\" i]",
+    "button[title*=\"микроф\" i]",
     "[aria-label*=\"microphone\" i]",
+    "[title*=\"microphone\" i]",
 ]
 
 CAMERA_SELECTORS = [
     "button[data-testid*=\"Camera\" i]",
     "button[data-testid*=\"Video\" i]",
+    "button[data-testid*=\"camera\" i]",
     "button[aria-label*=\"камер\" i]",
     "button[label*=\"камера\" i]",
+    "button[title*=\"камер\" i]",
     "[aria-label*=\"camera\" i]",
     "[aria-label*=\"video\" i]",
+    "[title*=\"camera\" i]",
 ]
 
 MIC_ON_HINTS = [
     "выключить микрофон",
-    "mute",
+    "mute microphone",
+    "mute mic",
     "turn off micro",
     "turn off mic",
+    "turn-off-mic",
+    "turn-off-microphone",
 ]
 
 MIC_OFF_HINTS = [
@@ -56,6 +72,8 @@ MIC_OFF_HINTS = [
     "unmute",
     "turn on micro",
     "turn on mic",
+    "turn-on-mic",
+    "turn-on-microphone",
 ]
 
 CAMERA_ON_HINTS = [
@@ -64,6 +82,7 @@ CAMERA_ON_HINTS = [
     "turn off camera",
     "turn video off",
     "stop video",
+    "turn-off-camera",
 ]
 
 CAMERA_OFF_HINTS = [
@@ -72,6 +91,7 @@ CAMERA_OFF_HINTS = [
     "turn on camera",
     "turn video on",
     "start video",
+    "turn-on-camera",
 ]
 
 
@@ -105,7 +125,7 @@ async def _click_any(page, selectors: List[str], timeout_ms: int):
 async def _click_final_join_button(page, timeout_ms: int) -> str:
     deadline = time.monotonic() * 1000 + timeout_ms
     poll_ms = 250
-    role_name = re.compile(r"присоединиться\s+к\s+встрече", re.I)
+    role_name = re.compile(r"присоединиться\s+к\s+встрече|подключиться", re.I)
 
     while time.monotonic() * 1000 < deadline:
         for selector in FINAL_JOIN_BUTTON_SELECTORS:
@@ -124,7 +144,7 @@ async def _click_final_join_button(page, timeout_ms: int) -> str:
                 button = role_loc.first
                 if await button.is_enabled(timeout=500):
                     await button.click(timeout=1000)
-                    return "role=button name=/присоединиться к встрече/i"
+                    return "role=button name=/присоединиться к встрече|подключиться/i"
         except Exception:
             pass
         await page.wait_for_timeout(poll_ms)
@@ -170,7 +190,13 @@ async def _finish_if_joined(page, logger, label: str) -> bool:
     return False
 
 
-async def wait_post_join_transition(page, timeouts: Dict[str, int], logger=None) -> bool:
+async def wait_post_join_transition(
+    page,
+    timeouts: Dict[str, int],
+    logger=None,
+    log_prefix: str = "",
+    final_join_clicked: bool = False,
+) -> bool:
     grace_ms = int(timeouts.get("post_join_grace_ms", 15000))
     after_join_ms = int(timeouts.get("after_join_ms", 180000))
     in_meeting_ms = int(timeouts.get("in_meeting_ms", after_join_ms))
@@ -178,46 +204,57 @@ async def wait_post_join_transition(page, timeouts: Dict[str, int], logger=None)
     deadline_ms = time.monotonic() * 1000 + max(after_join_ms, in_meeting_ms)
     grace_deadline_ms = time.monotonic() * 1000 + grace_ms
     start = time.monotonic()
-    final_join_clicked = False
+    final_join_clicks = 1 if final_join_clicked else 0
+    final_join_clicked_at_ms = time.monotonic() * 1000 if final_join_clicked else 0
 
-    _log(logger, f"post-join grace started {grace_ms}ms")
-    _log(logger, f"waiting in-meeting UI up to {max(after_join_ms, in_meeting_ms)}ms")
+    def log(message: str) -> None:
+        _log(logger, f"{log_prefix}{message}")
+
+    log(f"post-join grace started {grace_ms}ms")
+    log(f"waiting in-meeting UI up to {max(after_join_ms, in_meeting_ms)}ms")
 
     while time.monotonic() * 1000 < deadline_ms:
         if await is_joined_to_meeting(page):
             elapsed = int(time.monotonic() - start)
-            _log(logger, f"joined detected after {elapsed}s")
+            log(f"joined detected after {elapsed}s")
             return True
 
         state_info = await detect_join_state(page)
         state = state_info.get("state", "unknown")
         elapsed = int(time.monotonic() - start)
-        _log(
-            logger,
+        log(
             "post join state: "
             f"{state} elapsed={elapsed}s url={state_info.get('url', '')} "
             f"buttons={state_info.get('buttons', '-')}",
         )
 
         if state == "joined":
-            _log(logger, f"joined detected after {elapsed}s")
+            log(f"joined detected after {elapsed}s")
             return True
-        if state == "device_prejoin" and not final_join_clicked:
-            _log(logger, "device prejoin screen detected")
+        can_retry_final_join = (
+            final_join_clicked
+            and state == "telemost_prejoin"
+            and final_join_clicks < 2
+            and time.monotonic() * 1000 - final_join_clicked_at_ms > 15000
+        )
+        if state in ("device_prejoin", "telemost_prejoin") and (not final_join_clicked or can_retry_final_join):
+            log(f"{state} screen detected")
             try:
                 await ensure_media_disabled(page)
             except Exception as e:
-                _log(logger, f"device prejoin media toggle skipped: {e}")
-            _log(logger, "final join button detected")
-            _log(logger, "clicking final join button")
+                log(f"{state} media toggle skipped: {e}")
+            log("final join button detected")
+            log("clicking final join button")
             clicked_selector = await _click_final_join_button(page, int(timeouts.get("join_button_ms", 120000)))
             final_join_clicked = True
+            final_join_clicks += 1
+            final_join_clicked_at_ms = time.monotonic() * 1000
             deadline_ms = max(
                 deadline_ms,
                 time.monotonic() * 1000 + int(timeouts.get("final_join_after_click_ms", after_join_ms)),
             )
-            _log(logger, f"final join clicked: {clicked_selector}")
-            _log(logger, "waiting real in-meeting UI")
+            log(f"final join clicked: {clicked_selector}")
+            log("waiting real in-meeting UI")
             await page.wait_for_timeout(poll_ms)
             continue
         if state == "closed":
@@ -231,17 +268,17 @@ async def wait_post_join_transition(page, timeouts: Dict[str, int], logger=None)
             and not state_info.get("finalJoinButton")
             and time.monotonic() * 1000 > grace_deadline_ms
         ):
-            _log(logger, "post-join wait found another join/prejoin button; continuing configured join steps")
+            log("post-join wait found another join/prejoin button; continuing configured join steps")
             return False
 
         await page.wait_for_timeout(poll_ms)
 
     if await is_joined_to_meeting(page):
         elapsed = int(time.monotonic() - start)
-        _log(logger, f"joined detected after {elapsed}s at timeout boundary")
+        log(f"joined detected after {elapsed}s at timeout boundary")
         return True
     elapsed = int(time.monotonic() - start)
-    _log(logger, f"post-join timeout after {elapsed}s")
+    log(f"post-join timeout after {elapsed}s")
     return False
 
 
@@ -373,13 +410,25 @@ async def perform_join(page, join_cfg: Dict[str, Any], logger=None, timeouts: Di
     return await is_joined_to_meeting(page)
 
 
-def _is_on(label: str, on_hints: List[str], off_hints: List[str]) -> bool:
+def _control_state(label: str, on_hints: List[str], off_hints: List[str]) -> bool | None:
     lower = label.lower()
-    if any(h in lower for h in on_hints):
-        return True
     if any(h in lower for h in off_hints):
         return False
-    return True
+    if any(h in lower for h in on_hints):
+        return True
+    return None
+
+
+async def _control_label(loc) -> str:
+    values = []
+    for attr in ("aria-label", "label", "title", "data-testid", "aria-pressed", "aria-checked"):
+        try:
+            value = await loc.get_attribute(attr)
+        except Exception:
+            value = None
+        if value:
+            values.append(f"{attr}={value}")
+    return " ".join(values)
 
 
 async def _ensure_control_off(page, selectors: List[str], on_hints: List[str], off_hints: List[str]):
@@ -389,26 +438,28 @@ async def _ensure_control_off(page, selectors: List[str], on_hints: List[str], o
             if await loc.count() == 0:
                 continue
 
-            label = (
-                (await loc.get_attribute("aria-label"))
-                or (await loc.get_attribute("label"))
-                or ""
-            )
+            label = await _control_label(loc)
+            state = _control_state(label, on_hints, off_hints)
+            if state is False:
+                return True
+            if state is None:
+                continue
 
-            if _is_on(label, on_hints, off_hints):
+            if state is True:
                 await loc.click()
                 await page.wait_for_timeout(400)
 
-            label_after = (
-                (await loc.get_attribute("aria-label"))
-                or (await loc.get_attribute("label"))
-                or ""
-            )
-            if _is_on(label_after, on_hints, off_hints):
+            label_after = await _control_label(loc)
+            state_after = _control_state(label_after, on_hints, off_hints)
+            if state_after is False:
+                return True
+            if state_after is True:
                 await loc.click()
                 await page.wait_for_timeout(300)
+                label_after = await _control_label(loc)
+                if _control_state(label_after, on_hints, off_hints) is False:
+                    return True
 
-            return True
         except Exception:
             continue
     return False

@@ -3,8 +3,20 @@ import json
 
 JOINED_JS = r"""
 () => {
+  const contexts = [];
+  const addContext = (win) => {
+    try {
+      const doc = win.document;
+      if (!doc) return;
+      contexts.push({ win, doc });
+      for (let i = 0; i < win.frames.length; i += 1) addContext(win.frames[i]);
+    } catch (e) {}
+  };
+  addContext(window);
   const visible = (el) => {
-    const style = window.getComputedStyle(el);
+    if (!el) return false;
+    const win = el.ownerDocument && el.ownerDocument.defaultView || window;
+    const style = win.getComputedStyle(el);
     const rect = el.getBoundingClientRect();
     return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
   };
@@ -14,45 +26,116 @@ JOINED_JS = r"""
     el.getAttribute("label"),
     el.getAttribute("title"),
     el.getAttribute("data-testid"),
+    el.getAttribute("data-test-tag"),
     el.innerText,
     el.textContent,
   ].filter(Boolean).join(" "));
+  const query = (selector) => {
+    const out = [];
+    for (const ctx of contexts) {
+      try { out.push(...Array.from(ctx.doc.querySelectorAll(selector))); } catch(e) {}
+    }
+    return out;
+  };
 
-  const buttons = Array.from(document.querySelectorAll("button, [role='button'], [aria-label], [data-testid]"))
+  const buttons = query("button, [role='button'], a, [aria-label], [data-testid], [data-test-tag]")
     .filter(visible);
   const labels = buttons.map(textOf);
+  const bodyText = norm(contexts.map(ctx => {
+    try { return ctx.doc.body ? ctx.doc.body.innerText : ""; } catch(e) { return ""; }
+  }).join("\n"));
+  const compactBodyText = bodyText.replace(/\s+/g, " ");
+  const telemostHost = /(^|\.)telemost\.yandex\.ru$/i.test(location.hostname);
 
   const leaveHints = [
-    "покинуть", "выйти", "завершить", "leave", "hang up", "end call",
+    "покинуть", "выйти", "выйти из встречи", "завершить", "leave", "hang up", "end call", "end-call",
   ];
   const finalJoinHints = [
-    "присоединиться к встрече", "join meeting",
+    "присоединиться к встрече", "подключиться", "enter-conference", "join meeting",
   ];
   const controlHints = [
     "microphone", "camera", "video", "screensharing", "screen sharing",
     "микроф", "камер", "демонстрац", "экран", "поднять руку", "raise_hand", "raise hand",
+    "participants-button", "chat-alt-button", "start-demonstration", "more-popup", "участники", "чат",
   ];
 
   const finalJoinButton = labels.some(label => finalJoinHints.some(h => label.includes(h)));
   const leaveButton = labels.some(label => leaveHints.some(h => label.includes(h)));
+  const participantsButton = labels.some(label => label.includes("participants-button") || label.includes("участники"));
+  const chatButton = labels.some(label => label.includes("chat-alt-button") || label.includes("открыть чат") || /(^|\s)чат($|\s)/.test(label));
   const controlCount = labels.filter(label => controlHints.some(h => label.includes(h))).length;
-  const chatInput = !!Array.from(document.querySelectorAll("[contenteditable='true'], textarea, input"))
+  const chatInput = !!query("[contenteditable='true'], textarea, input")
     .find(el => visible(el) && /сообщ|message|chat|введите/.test(textOf(el)));
-  const mediaLayout = !!Array.from(document.querySelectorAll("video, canvas, [data-testid*='Layout' i], [data-testid*='Webinar' i], [class*='webinar' i], [class*='conference' i], [class*='meeting' i]"))
+  const mediaLayout = !!query("video, canvas, [data-testid*='Layout' i], [data-testid*='Webinar' i], [class*='webinar' i], [class*='conference' i], [class*='meeting' i]")
     .find(visible);
-  const bodyText = norm(document.body ? document.body.innerText : "");
+  const telemostContinue = telemostHost && (
+    compactBodyText.includes("подключение к звонку")
+    || compactBodyText.includes("вы подключаетесь к видеовстрече")
+    || labels.some(label => label.includes("meeting-continue-in-browser-continue") || label.includes("продолжить в браузере"))
+  );
+  const telemostBlocking = telemostHost && (
+    compactBodyText.includes("большое обновление в телемосте")
+    || compactBodyText.includes("разрешите находить вас")
+    || compactBodyText.includes("проверьте профиль")
+    || compactBodyText.includes("включить видео не удалось")
+    || compactBodyText.includes("включить микрофон не удалось")
+  );
+  const telemostPrejoin = telemostHost && !telemostContinue
+    && (
+      compactBodyText.includes("ваше имя на встрече")
+      || labels.some(label => label.includes("подключиться") || label.includes("enter-conference"))
+    );
+  const telemostConnecting = telemostHost && (
+    compactBodyText.includes("групповой звонок подключение")
+    || (!telemostContinue && !telemostPrejoin && /(^|\s)подключение($|\s)/.test(compactBodyText))
+  );
   const deviceControl = /камера|микрофон|проверить звук|camera|microphone|audio input/.test(bodyText)
     || labels.some(label => /камера|микрофон|camera|microphone/.test(label));
-  const devicePreview = !!Array.from(document.querySelectorAll("video, canvas, [class*='preview' i], [class*='avatar' i]")).find(visible);
+  const devicePreview = !!query("video, canvas, [class*='preview' i], [class*='avatar' i]").find(visible);
   const urlLooksInside = /\/(event|webinar|meeting|room|session|call)\b/i.test(location.pathname)
     && !/landing|enter|login/i.test(location.pathname);
 
-  if (finalJoinButton || (deviceControl && devicePreview && !leaveButton)) {
-    return { joined: false, finalJoinButton, deviceControl, devicePreview, leaveButton, controlCount, chatInput, mediaLayout, url: location.href };
+  if (telemostBlocking || telemostContinue || telemostPrejoin || telemostConnecting || finalJoinButton || (deviceControl && devicePreview && !leaveButton)) {
+    return {
+      joined: false,
+      telemostBlocking,
+      telemostContinue,
+      telemostPrejoin,
+      telemostConnecting,
+      finalJoinButton,
+      deviceControl,
+      devicePreview,
+      leaveButton,
+      participantsButton,
+      chatButton,
+      controlCount,
+      chatInput,
+      mediaLayout,
+      url: location.href
+    };
   }
 
-  const joined = leaveButton || (mediaLayout && (chatInput || controlCount >= 1)) || (urlLooksInside && leaveButton);
-  return { joined, finalJoinButton, deviceControl, devicePreview, leaveButton, controlCount, chatInput, mediaLayout, url: location.href };
+  const telemostJoined = telemostHost && leaveButton && (participantsButton || chatButton);
+  const joined = telemostHost
+    ? telemostJoined
+    : (leaveButton || (mediaLayout && (chatInput || controlCount >= 1)) || (urlLooksInside && leaveButton));
+  return {
+    joined,
+    telemostBlocking,
+    telemostContinue,
+    telemostPrejoin,
+    telemostConnecting,
+    finalJoinButton,
+    deviceControl,
+    devicePreview,
+    leaveButton,
+    participantsButton,
+    chatButton,
+    controlCount,
+    chatInput,
+    mediaLayout,
+    url: location.href
+  };
 }
 """
 
@@ -71,24 +154,41 @@ JOIN_STATE_JS = r"""
     el.getAttribute("label"),
     el.getAttribute("title"),
     el.getAttribute("data-testid"),
+    el.getAttribute("data-test-tag"),
     el.getAttribute("placeholder"),
     el.innerText,
     el.textContent,
   ].filter(Boolean).join(" "));
 
   const bodyText = norm(document.body ? document.body.innerText : "");
+  const compactBodyText = bodyText.replace(/\s+/g, " ");
   const bodyLength = bodyText.trim().length;
   const url = location.href;
-  const buttons = Array.from(document.querySelectorAll("button, [role='button']"))
+  const buttons = Array.from(document.querySelectorAll("button, [role='button'], a, [aria-label], [data-testid], [data-test-tag]"))
     .filter(visible);
   const labels = buttons.map(textOf);
+  const telemostHost = /(^|\.)telemost\.yandex\.ru$/i.test(location.hostname);
 
-  const joinHints = ["присоедин", "войти", "join", "enter"];
-  const finalJoinHints = ["присоединиться к встрече", "join meeting"];
+  const joinHints = ["присоедин", "подключ", "войти", "join", "enter"];
+  const finalJoinHints = ["присоединиться к встрече", "подключиться", "join meeting"];
   const joinButton = labels.some(label => joinHints.some(h => label.includes(h)));
   const finalJoinButton = labels.some(label => finalJoinHints.some(h => label.includes(h)));
   const nameInput = !!document.querySelector("#name, input[name*='name' i], input[placeholder*='имя' i], input[placeholder*='name' i]");
   const landingForm = !!document.querySelector("#EventEnterForm") || (nameInput && joinButton);
+  const telemostContinue = telemostHost && (
+    compactBodyText.includes("подключение к звонку")
+    || compactBodyText.includes("вы подключаетесь к видеовстрече")
+    || labels.some(label => label.includes("meeting-continue-in-browser-continue") || label.includes("продолжить в браузере") || label.includes("continueinbrowserbutton"))
+  );
+  const telemostBlocking = telemostHost && (
+    compactBodyText.includes("большое обновление в телемосте")
+    || compactBodyText.includes("разрешите находить вас")
+    || compactBodyText.includes("проверьте профиль")
+    || compactBodyText.includes("включить видео не удалось")
+    || compactBodyText.includes("включить микрофон не удалось")
+  );
+  const telemostPrejoin = telemostHost && !telemostContinue
+    && labels.some(label => label.includes("подключиться") || label.includes("enter-conference"));
   const deviceControl = /камера|микрофон|проверить звук|camera|microphone|audio input/.test(bodyText)
     || labels.some(label => /камера|микрофон|camera|microphone/.test(label));
   const devicePreview = !!Array.from(document.querySelectorAll("video, canvas, [class*='preview' i], [class*='avatar' i]")).find(visible);
@@ -102,7 +202,10 @@ JOIN_STATE_JS = r"""
     && !loadingText;
 
   let state = "unknown";
-  if (finalJoinButton || (deviceControl && devicePreview && joinButton)) state = "device_prejoin";
+  if (telemostBlocking) state = "telemost_overlay";
+  else if (telemostPrejoin) state = "telemost_prejoin";
+  else if (telemostContinue) state = "telemost_continue_browser";
+  else if (finalJoinButton || (deviceControl && devicePreview && joinButton)) state = "device_prejoin";
   else if (landingForm && joinButton) state = nameInput ? "landing" : "prejoin";
   else if (spinner || loadingText || rootOnly || bodyLength < 20) state = "loading";
   else if (explicitError) state = "explicit_error";
@@ -115,6 +218,9 @@ JOIN_STATE_JS = r"""
     joinButton,
     finalJoinButton,
     nameInput,
+    telemostContinue,
+    telemostBlocking,
+    telemostPrejoin,
     deviceControl,
     devicePreview,
     spinner,

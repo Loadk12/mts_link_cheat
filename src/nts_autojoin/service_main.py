@@ -15,20 +15,31 @@ from .settings import get_logs_dir, load_config
 from .logging_setup import setup_logger
 from .power import keep_awake, on_ac_power
 from .notifier import notify
-from .scheduler import schedule_jobs, run_meeting, request_stop_active
+from .scheduler import (
+    _active_run_for_url,
+    _keep_task,
+    _meeting_active_on,
+    catch_up_running_meetings,
+    schedule_jobs,
+    run_meeting,
+    request_stop_active,
+)
 from .tg_commands import run_bot
 from .link_updater import scrape_and_update
 from .live import get_any_page
 
 
 def _occurrences_today(
-    cron_expr: str, tzinfo, limit_per_job: int = 8
+    cron_expr: str, tzinfo, limit_per_job: int = 8, from_start_of_day: bool = False
 ) -> List[datetime]:
     trigger = CronTrigger.from_crontab(cron_expr, timezone=tzinfo)
     now = datetime.now(tzinfo).replace(microsecond=0)
     eod = now.replace(hour=23, minute=59, second=59)
     last = None
-    cur = now - timedelta(seconds=1)
+    if from_start_of_day:
+        cur = now.replace(hour=0, minute=0, second=0)
+    else:
+        cur = now - timedelta(seconds=1)
     out: List[datetime] = []
     for _ in range(limit_per_job):
         nxt = trigger.get_next_fire_time(last, cur)
@@ -38,6 +49,44 @@ def _occurrences_today(
         last = nxt
         cur = nxt + timedelta(seconds=1)
     return out
+
+
+_MODE_SUFFIX = {
+    "offline": " · очно",
+    "online_manual": " · вручную",
+}
+
+
+def _today_digest_lines(cfg: Dict[str, Any], from_start_of_day: bool) -> List[str]:
+    """
+    Строки дайджеста на сегодня: только пары, у которых сегодня попадает
+    в start_date/end_date, отсортированные по времени.
+    """
+    tzinfo = tz.gettz(cfg.get("timezone", "Europe/Moscow"))
+    today = datetime.now(tzinfo).date()
+    items: List[Tuple[datetime, str]] = []
+    for m in cfg.get("meetings", []) or []:
+        if not isinstance(m, dict):
+            continue
+        cron_expr = m.get("cron")
+        if not cron_expr or not _meeting_active_on(m, today):
+            continue
+        name = m.get("name", "Без названия")
+        dur = int(m.get("duration_minutes", 45))
+        mode = m.get("meeting_mode") or ("online_auto" if m.get("url") else "")
+        suffix = _MODE_SUFFIX.get(mode, "")
+        if mode == "online_auto" and not m.get("url"):
+            suffix = " · нет ссылки"
+        try:
+            occurrences = _occurrences_today(
+                cron_expr, tzinfo, from_start_of_day=from_start_of_day
+            )
+        except Exception:
+            continue
+        for dt in occurrences:
+            items.append((dt, f"• {dt.strftime('%H:%M')} — {name} ({dur} мин){suffix}"))
+    items.sort(key=lambda x: x[0])
+    return [line for _dt, line in items]
 
 
 async def main():
@@ -60,15 +109,53 @@ async def main():
     tzname = cfg.get("timezone", "Europe/Moscow")
     tzinfo = tz.gettz(tzname)
 
-    async def _dmami_pull_job(notify_result: bool = False):
+    def _reschedule(new_cfg: Dict[str, Any]) -> None:
+        """
+        Полностью пересобрать задачи планировщика: встречи, напоминания и
+        служебные задачи (daily_summary). Затем догнать пары, которые уже идут.
+        """
         nonlocal cfg
+        scheduler.remove_all_jobs()
+        schedule_jobs(scheduler, new_cfg, logger)
+        cfg = new_cfg
+        _schedule_service_jobs()
+        started = catch_up_running_meetings(cfg, logger)
+        if started:
+            logger.info("catch-up started: %s", started)
+
+    def _schedule_service_jobs() -> None:
+        ncfg = cfg.get("notify") or {}
+        if not ncfg.get("daily_summary"):
+            return
+        h = int(ncfg.get("daily_summary_hour", 7))
+        m = int(ncfg.get("daily_summary_minute", 0))
+        scheduler.add_job(
+            _daily_summary,
+            trigger=CronTrigger(hour=h, minute=m, timezone=tzinfo),
+            id="daily_summary",
+            name="daily_summary",
+            coalesce=True,
+            misfire_grace_time=600,
+            max_instances=1,
+            replace_existing=True,
+        )
+
+    async def _daily_summary():
+        try:
+            now = datetime.now(tzinfo)
+            lines = [
+                f"Доброе утро! План на сегодня ({now.strftime('%d.%m.%Y')}):"
+            ]
+            lines += _today_digest_lines(cfg, from_start_of_day=True) or ["• пар нет"]
+            await notify(cfg, "\n".join(lines))
+        except Exception as e:
+            logger.warning(f"daily_summary error: {e}")
+
+    async def _dmami_pull_job(notify_result: bool = False):
         try:
             updated, _changes = await scrape_and_update(cfg, logger)
             # перечитать конфиг и перепланировать
-            new_cfg = load_config()
-            scheduler.remove_all_jobs()
-            schedule_jobs(scheduler, new_cfg, logger)
-            cfg = new_cfg
+            _reschedule(load_config())
             report = _changes[0] if _changes else f"DMAMI sync завершён. Updated URLs: {updated}."
             if notify_result:
                 await notify(cfg, report)
@@ -83,6 +170,7 @@ async def main():
 
     scheduler = AsyncIOScheduler(timezone=tzinfo)
     schedule_jobs(scheduler, cfg, logger)
+    _schedule_service_jobs()
 
     scheduler.start()
 
@@ -100,72 +188,29 @@ async def main():
             pass
         if dmami_cfg.get("auto_generate_on_start", False):
             logger.info("dmami.auto_generate_on_start=true, starting DMAMI sync.")
-            asyncio.create_task(_dmami_pull_job(notify_result=True))
+            _keep_task(asyncio.create_task(_dmami_pull_job(notify_result=True)))
 
     # стартовый дайджест
     ncfg = cfg.get("notify") or {}
     if ncfg.get("on_start_summary"):
         try:
-            lines = ["Бот стартанул. Текущие встречи на сегодня:"]
-            tzinfo = tz.gettz(cfg.get("timezone", "Europe/Moscow"))
-            now = datetime.now(tzinfo)
-            for m in cfg.get("meetings", []) or []:
-                name = m.get("name", "Без названия")
-                dur = int(m.get("duration_minutes", 45))
-                cron_expr = m.get("cron")
-                if not cron_expr:
-                    continue
-                for dt in _occurrences_today(cron_expr, tzinfo):
-                    lines.append(
-                        f"• {dt.strftime('%H:%M')} — {name} ({dur} мин)"
-                    )
-            msg = "\n".join(lines)
-            await notify(cfg, msg)
+            lines = ["Бот стартанул. Оставшиеся встречи на сегодня:"]
+            lines += _today_digest_lines(cfg, from_start_of_day=False) or ["• больше пар нет"]
+            await notify(cfg, "\n".join(lines))
         except Exception as e:
             logger.warning(f"Стартовый дайджест не удался: {e}")
 
-    # ежедневный дайджест
-    if ncfg.get("daily_summary"):
-        h = int(ncfg.get("daily_summary_hour", 7))
-        m = int(ncfg.get("daily_summary_minute", 0))
-        scheduler.add_job(
-            lambda: asyncio.create_task(_daily_summary(cfg, logger)),
-            trigger=CronTrigger(hour=h, minute=m, timezone=tzinfo),
-            name="daily_summary",
-            coalesce=True,
-            misfire_grace_time=600,
-            max_instances=1,
-            replace_existing=True,
-        )
-
-    async def _daily_summary(cfg: Dict[str, Any], logger):
-        try:
-            tzinfo = tz.gettz(cfg.get("timezone", "Europe/Moscow"))
-            now = datetime.now(tzinfo)
-            lines = [
-                f"Доброе утро! План на сегодня ({now.strftime('%d.%m.%Y')}):"
-            ]
-            for m in cfg.get("meetings", []) or []:
-                name = m.get("name", "Без названия")
-                dur = int(m.get("duration_minutes", 45))
-                cron_expr = m.get("cron")
-                if not cron_expr:
-                    continue
-                for dt in _occurrences_today(cron_expr, tzinfo):
-                    lines.append(
-                        f"• {dt.strftime('%H:%M')} — {name} ({dur} мин)"
-                    )
-            await notify(cfg, "\n".join(lines))
-        except Exception as e:
-            logger.warning(f"daily_summary error: {e}")
+    # догоняем пару, если сервис стартовал посреди неё
+    try:
+        started = catch_up_running_meetings(cfg, logger)
+        if started:
+            logger.info("catch-up on start: %s", started)
+    except Exception as e:
+        logger.error(f"catch-up on start failed: {e}")
 
     async def reload_cb():
-        nonlocal cfg
         try:
-            new_cfg = load_config()
-            scheduler.remove_all_jobs()
-            schedule_jobs(scheduler, new_cfg, logger)
-            cfg = new_cfg
+            _reschedule(load_config())
         except Exception as e:
             logger.error(f"reload error: {e}")
             raise
@@ -213,7 +258,7 @@ async def main():
         target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if target > now:
             seconds_left = (target - now).total_seconds()
-            dur = max(int(seconds_left // 60), 5)
+            dur = max(1, int((seconds_left + 59) // 60))
             end = target
         else:
             # время уже прошло → воспринимаем dur_min как «сидеть столько минут от сейчас»
@@ -235,15 +280,25 @@ async def main():
             "name": f"Ad-hoc ({hh:02d}:{mm:02d}, {dur} мин)",
             "url": url,
             "duration_minutes": dur,
+            "deadline_at": end,
             "join": join_cfg,
         }
 
         chromium_cfg = cfg.get("chromium", {}) or {}
         hc_cfg = cfg.get("healthcheck", {}) or {}
 
+        busy_with = _active_run_for_url(url)
+        if busy_with:
+            return (
+                f"ℹ️ Уже сижу в этой встрече: [{busy_with}].\n"
+                f"Для перезахода сначала /disconnect."
+            )
+
         # запускаем как независимую задачу, чтобы не блокировать бота
-        asyncio.create_task(
-            run_meeting(meeting, tzname, chromium_cfg, hc_cfg, cfg, logger)
+        _keep_task(
+            asyncio.create_task(
+                run_meeting(meeting, tzname, chromium_cfg, hc_cfg, cfg, logger)
+            )
         )
         return (
             f"⚡ Подключаюсь сейчас.\n"
